@@ -21,7 +21,7 @@
   .image-box img { max-width: 100%; max-height: 100%; object-fit: contain; }
   .prompt-section { margin-top: 24px; }
   .prompt-label { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 8px; }
-  .prompt-field { width: 100%; min-height: 100px; padding: 14px; background: #141414; border: 1px solid #222; border-radius: 8px; color: #e0e0e0; font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical; outline: none; transition: border-color 0.2s; }
+  .prompt-field { width: 100%; min-height: 60px; padding: 14px; background: #141414; border: 1px solid #222; border-radius: 8px; color: #e0e0e0; font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical; outline: none; transition: border-color 0.2s; }
   .prompt-field:focus { border-color: #4f9eff; }
   .prompt-field::placeholder { color: #444; }
   .step-divider { margin: 32px 0 24px; border-top: 1px solid #222; padding-top: 24px; }
@@ -50,12 +50,12 @@
 </div>
 <div class="container">
   <!-- Step 1: Gemini Processing -->
-  <div id="outputPanel" style="display:none;max-width:550px;margin:0 auto">
-    <div class="image-box" style="min-height:450px">
+  <div id="outputPanel" style="max-width:400px;margin:0 auto">
+    <div class="image-box" style="min-height:200px">
       <img id="outputImg">
     </div>
   </div>
-  <div id="spinnerWrap" style="display:none;text-align:center;padding:40px">
+  <div id="spinnerWrap" style="display:none;text-align:center;padding:20px">
     <div class="spinner" id="spinner" style="display:inline-block;margin:0 auto"></div>
   </div>
 
@@ -69,7 +69,7 @@
   <div class="status" id="status"></div>
 
   <!-- Step 2: 3D Generation -->
-  <div class="step-divider" id="step2Section" style="display:none">
+  <div class="step-divider" id="step2Section">
     <h2>🪩 Step 2 — 3D Model Generation</h2>
     <p>Send processed image to Trellis 2 (Microsoft) to generate a 3D model</p>
   </div>
@@ -77,7 +77,7 @@
     <div class="panel-title">3D Preview</div>
     <div class="viewer-canvas" id="viewerCanvas"></div>
   </div>
-  <div class="btn-row" id="step2Btns" style="display:none">
+  <div class="btn-row" id="step2Btns">
     <button class="btn btn-primary" id="generate3dBtn">🪩 Generate 3D with Trellis 2</button>
     <a class="btn btn-primary" id="downloadBtn" style="display:none;text-decoration:none" download>⬇ Download GLB</a>
   </div>
@@ -107,7 +107,15 @@ processBtn.addEventListener('click', async () => {
     formData.append('prompt', document.getElementById('promptField').value);
 
     const resp = await fetch('/api/process', { method: 'POST', body: formData });
-    const data = await resp.json();
+    const text = await resp.text();
+    let data;
+    try { data = JSON.parse(text); } catch(e) {
+      statusEl.textContent = 'Server error: ' + text.substring(0, 200);
+      statusEl.className = 'status error';
+      document.getElementById('spinnerWrap').style.display = 'none';
+      processBtn.disabled = false;
+      return;
+    }
     if (data.success) {
       outputImg.src = 'data:image/png;base64,' + data.image;
       document.getElementById('outputPanel').style.display = '';
@@ -142,7 +150,16 @@ function showStep2() {
 }
 
 generate3dBtn.addEventListener('click', async () => {
-  if (!processedImageB64) { status3d.textContent = 'Process an image first'; status3d.className = 'status error'; return; }
+  let imageToSend = processedImageB64;
+  // If no Gemini output yet, fetch and use the base image
+  if (!imageToSend) {
+    status3d.textContent = 'No Gemini output — using base image...';
+    status3d.className = 'status';
+    const resp = await fetch('/base_character.png');
+    const blob = await resp.blob();
+    const reader = new FileReader();
+    imageToSend = await new Promise(r => { reader.onload = () => r(reader.result.split(',')[1]); reader.readAsDataURL(blob); });
+  }
   generate3dBtn.disabled = true;
   status3d.textContent = 'Sending to Trellis 2... this takes 30\u2013120 seconds. Please wait.';
   status3d.className = 'status';
@@ -151,9 +168,16 @@ generate3dBtn.addEventListener('click', async () => {
     const resp = await fetch('/api/generate3d', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ image: processedImageB64 })
+      body: JSON.stringify({ image: imageToSend })
     });
-    const data = await resp.json();
+    const text = await resp.text();
+    let data;
+    try { data = JSON.parse(text); } catch(e) {
+      status3d.textContent = 'Server error: ' + text.substring(0, 200);
+      status3d.className = 'status error';
+      generate3dBtn.disabled = false;
+      return;
+    }
     if (data.success) {
       status3d.textContent = '3D model generated!';
       status3d.className = 'status success';
