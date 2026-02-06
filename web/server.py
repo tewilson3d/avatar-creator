@@ -22,9 +22,10 @@ PROMPT = (
 )
 
 
-def call_gemini(image_bytes: bytes, mime_type: str) -> tuple[bool, str]:
+def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[bool, str]:
     """Send image to Gemini, return (success, base64_image_or_error)."""
     image_b64 = base64.b64encode(image_bytes).decode()
+    text = prompt.strip() if prompt.strip() else PROMPT
 
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/"
@@ -34,7 +35,7 @@ def call_gemini(image_bytes: bytes, mime_type: str) -> tuple[bool, str]:
         "contents": [{
             "parts": [
                 {"inlineData": {"mimeType": mime_type, "data": image_b64}},
-                {"text": PROMPT},
+                {"text": text},
             ]
         }],
         "generationConfig": {
@@ -87,6 +88,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         image_bytes = None
         mime_type = "image/png"
+        prompt = ""
 
         for part in parts:
             if b"name=\"image\"" in part:
@@ -98,18 +100,24 @@ class Handler(SimpleHTTPRequestHandler):
                 data_start = part.find(b"\r\n\r\n")
                 if data_start != -1:
                     image_bytes = part[data_start + 4:].rstrip(b"\r\n--")
-                    # Strip trailing boundary artifacts
                     if image_bytes.endswith(b"--"):
                         image_bytes = image_bytes[:-2]
                     if image_bytes.endswith(b"\r\n"):
                         image_bytes = image_bytes[:-2]
+            elif b"name=\"prompt\"" in part:
+                data_start = part.find(b"\r\n\r\n")
+                if data_start != -1:
+                    prompt = part[data_start + 4:].rstrip(b"\r\n--").decode("utf-8", errors="replace").strip()
+                    if prompt.endswith("--"):
+                        prompt = prompt[:-2].strip()
 
         if not image_bytes:
             self._json_response({"success": False, "error": "No image in request"})
             return
 
         print(f"Processing image: {len(image_bytes)} bytes, {mime_type}")
-        success, result = call_gemini(image_bytes, mime_type)
+        print(f"Prompt: {prompt[:100]}..." if len(prompt) > 100 else f"Prompt: {prompt}")
+        success, result = call_gemini(image_bytes, mime_type, prompt)
 
         if success:
             self._json_response({"success": True, "image": result})

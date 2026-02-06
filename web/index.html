@@ -29,6 +29,11 @@
   .btn-primary { background: #4f9eff; color: #fff; }
   .btn-primary:hover { background: #3a8fee; }
   .btn-primary:disabled { background: #333; color: #666; cursor: not-allowed; }
+  .prompt-section { margin-top: 24px; }
+  .prompt-label { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 8px; }
+  .prompt-field { width: 100%; min-height: 100px; padding: 14px; background: #141414; border: 1px solid #222; border-radius: 8px; color: #e0e0e0; font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical; outline: none; transition: border-color 0.2s; }
+  .prompt-field:focus { border-color: #4f9eff; }
+  .prompt-field::placeholder { color: #444; }
   .btn-row { display: flex; justify-content: center; gap: 12px; }
   .spinner { display: none; width: 32px; height: 32px; border: 3px solid #333; border-top-color: #4f9eff; border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -63,6 +68,10 @@
         <img id="outputImg" style="display:none">
       </div>
     </div>
+  </div>
+  <div class="prompt-section">
+    <div class="prompt-label">Gemini Prompt</div>
+    <textarea class="prompt-field" id="promptField" placeholder="Instructions for Gemini image processing...">Edit this image: Remove the entire background and replace it with a plain solid white background. Keep the character exactly as they are — same pose, same proportions, same details, same colors. Do not change, crop, or alter the character in any way. The output should be the full character cleanly isolated on a pure white (#FFFFFF) background, suitable as input for an AI 3D model generator.</textarea>
   </div>
   <div class="btn-row">
     <button class="btn btn-primary" id="processBtn" disabled>⚡ Process with Gemini</button>
@@ -107,6 +116,7 @@ processBtn.addEventListener('click', async () => {
 
   const formData = new FormData();
   formData.append('image', selectedFile);
+  formData.append('prompt', document.getElementById('promptField').value);
 
   try {
     const resp = await fetch('/api/process', { method: 'POST', body: formData });
