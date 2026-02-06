@@ -50,20 +50,13 @@
 </div>
 <div class="container">
   <!-- Step 1: Gemini Processing -->
-  <div class="panels">
-    <div class="panel">
-      <div class="panel-title">Base Character</div>
-      <div class="image-box">
-        <img src="/base_character.png" alt="Base character">
-      </div>
+  <div id="outputPanel" style="display:none;max-width:550px;margin:0 auto">
+    <div class="image-box" style="min-height:450px">
+      <img id="outputImg">
     </div>
-    <div class="panel">
-      <div class="panel-title">Gemini Output</div>
-      <div class="image-box" id="outputArea">
-        <div class="spinner" id="spinner"></div>
-        <img id="outputImg" style="display:none">
-      </div>
-    </div>
+  </div>
+  <div id="spinnerWrap" style="display:none;text-align:center;padding:40px">
+    <div class="spinner" id="spinner" style="display:inline-block;margin:0 auto"></div>
   </div>
 
   <div class="prompt-section">
@@ -100,8 +93,8 @@ let processedImageB64 = null;
 
 processBtn.addEventListener('click', async () => {
   processBtn.disabled = true;
-  spinner.style.display = 'block';
-  outputImg.style.display = 'none';
+  document.getElementById('outputPanel').style.display = 'none';
+  document.getElementById('spinnerWrap').style.display = '';
   statusEl.textContent = 'Sending to Gemini...';
   statusEl.className = 'status';
 
@@ -117,7 +110,7 @@ processBtn.addEventListener('click', async () => {
     const data = await resp.json();
     if (data.success) {
       outputImg.src = 'data:image/png;base64,' + data.image;
-      outputImg.style.display = 'block';
+      document.getElementById('outputPanel').style.display = '';
       processedImageB64 = data.image;
       statusEl.textContent = 'Done! Image processed.';
       statusEl.className = 'status success';
@@ -130,7 +123,7 @@ processBtn.addEventListener('click', async () => {
     statusEl.textContent = 'Error: ' + e.message;
     statusEl.className = 'status error';
   } finally {
-    spinner.style.display = 'none';
+    document.getElementById('spinnerWrap').style.display = 'none';
     processBtn.disabled = false;
   }
 });
