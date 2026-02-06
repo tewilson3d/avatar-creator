@@ -20,8 +20,8 @@ from pathlib import Path
 # Gemini model with native image output (the "nano banana" model)
 # Fallback chain: newest → oldest
 MODELS = [
+    "gemini-3-pro-image-preview",
     "gemini-2.0-flash-exp-image-generation",
-    "gemini-2.5-flash-preview-image-generation",
 ]
 
 PROMPT_BG_REMOVAL = (
