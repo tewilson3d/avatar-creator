@@ -10,6 +10,7 @@ from pathlib import Path
 
 PORT = 8000
 WEB_DIR = Path(__file__).parent
+MODELS_DIR = Path(__file__).parent.parent / "models"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = "gemini-3-pro-image-preview"
 
@@ -69,11 +70,118 @@ def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[b
     return False, "Gemini returned no image"
 
 
+def generate_3d_trellis(image_bytes: bytes) -> tuple[bool, str]:
+    """Send image to Trellis 2 HF Space, return (success, glb_path_or_error)."""
+    try:
+        from gradio_client import Client, handle_file
+    except ImportError:
+        return False, "gradio_client not installed"
+
+    import tempfile
+    import shutil
+
+    # Write image to temp file
+    tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    tmp_img.write(image_bytes)
+    tmp_img.close()
+
+    try:
+        print("Connecting to Trellis 2 HF Space...")
+        client = Client("microsoft/TRELLIS.2")
+
+        # Start session
+        print("Starting session...")
+        client.predict(api_name="/start_session")
+
+        # Preprocess image
+        print("Preprocessing image...")
+        processed = client.predict(
+            input=handle_file(tmp_img.name),
+            api_name="/preprocess_image"
+        )
+
+        # Get seed
+        seed = client.predict(
+            randomize_seed=True,
+            seed=0,
+            api_name="/get_seed"
+        )
+        print(f"Seed: {seed}")
+
+        # Generate 3D
+        print("Generating 3D model (this takes 30-120s)...")
+        preview = client.predict(
+            image=processed,
+            seed=seed,
+            resolution="512",
+            ss_guidance_strength=7.5,
+            ss_guidance_rescale=0.7,
+            ss_sampling_steps=12,
+            ss_rescale_t=5.0,
+            shape_slat_guidance_strength=7.5,
+            shape_slat_guidance_rescale=0.5,
+            shape_slat_sampling_steps=12,
+            shape_slat_rescale_t=3.0,
+            tex_slat_guidance_strength=1.0,
+            tex_slat_guidance_rescale=0.0,
+            tex_slat_sampling_steps=12,
+            tex_slat_rescale_t=3.0,
+            api_name="/image_to_3d"
+        )
+        print(f"3D generation done. Extracting GLB...")
+
+        # Extract GLB
+        result = client.predict(
+            decimation_target=300000,
+            texture_size=2048,
+            api_name="/extract_glb"
+        )
+        print(f"Extract result: {result}")
+
+        # result is (glb_path, download_path)
+        glb_source = result[0] if isinstance(result, (list, tuple)) else result
+
+        # Copy to our models dir
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        import time
+        glb_dest = MODELS_DIR / f"trellis_{int(time.time())}.glb"
+        shutil.copy2(glb_source, glb_dest)
+        print(f"GLB saved: {glb_dest}")
+
+        return True, str(glb_dest)
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return False, str(e)
+    finally:
+        os.unlink(tmp_img.name)
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
+    def do_GET(self):
+        # Serve GLB files from models dir
+        if self.path.startswith("/models/"):
+            filename = self.path.split("/models/")[-1]
+            filepath = MODELS_DIR / filename
+            if filepath.exists() and filepath.suffix == ".glb":
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "model/gltf-binary")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+        return super().do_GET()
+
     def do_POST(self):
+        if self.path == "/api/generate3d":
+            return self._handle_generate3d()
         if self.path != "/api/process":
             self.send_error(404)
             return
@@ -121,6 +229,27 @@ class Handler(SimpleHTTPRequestHandler):
 
         if success:
             self._json_response({"success": True, "image": result})
+        else:
+            self._json_response({"success": False, "error": result})
+
+    def _handle_generate3d(self):
+        """Accept base64 PNG image, send to Trellis 2, return GLB path."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+
+        image_b64 = data.get("image", "")
+        if not image_b64:
+            self._json_response({"success": False, "error": "No image provided"})
+            return
+
+        image_bytes = base64.b64decode(image_b64)
+        print(f"Generate 3D: {len(image_bytes)} bytes")
+
+        success, result = generate_3d_trellis(image_bytes)
+        if success:
+            filename = Path(result).name
+            self._json_response({"success": True, "glb_url": f"/models/{filename}", "filename": filename})
         else:
             self._json_response({"success": False, "error": result})
 

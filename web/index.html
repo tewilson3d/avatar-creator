@@ -3,7 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Avatar Pipeline — Gemini Image Processor</title>
+<title>Avatar Pipeline</title>
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
+</script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; }
@@ -34,6 +37,12 @@
   .prompt-field { width: 100%; min-height: 100px; padding: 14px; background: #141414; border: 1px solid #222; border-radius: 8px; color: #e0e0e0; font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical; outline: none; transition: border-color 0.2s; }
   .prompt-field:focus { border-color: #4f9eff; }
   .prompt-field::placeholder { color: #444; }
+  .step-divider { margin: 32px 0 24px; border-top: 1px solid #222; padding-top: 24px; }
+  .step-divider h2 { font-size: 16px; font-weight: 600; color: #fff; margin-bottom: 4px; }
+  .step-divider p { font-size: 13px; color: #888; }
+  .viewer-panel { background: #141414; border: 1px solid #222; border-radius: 12px; padding: 20px; }
+  .viewer-canvas { width: 100%; height: 500px; border-radius: 8px; background: #0d0d0d; position: relative; }
+  .viewer-canvas canvas { border-radius: 8px; }
   .btn-row { display: flex; justify-content: center; gap: 12px; }
   .spinner { display: none; width: 32px; height: 32px; border: 3px solid #333; border-top-color: #4f9eff; border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
@@ -77,6 +86,19 @@
     <button class="btn btn-primary" id="processBtn" disabled>⚡ Process with Gemini</button>
   </div>
   <div class="status" id="status"></div>
+  <div class="step-divider" id="step2Section" style="display:none">
+    <h2>🪩 Step 2 — 3D Model Generation</h2>
+    <p>Send processed image to Trellis 2 (Microsoft) to generate a 3D model</p>
+  </div>
+  <div class="viewer-panel" id="viewerPanel" style="display:none">
+    <div class="panel-title">3D Preview</div>
+    <div class="viewer-canvas" id="viewerCanvas"></div>
+  </div>
+  <div class="btn-row" id="step2Btns" style="display:none">
+    <button class="btn btn-primary" id="generate3dBtn">🪩 Generate 3D with Trellis 2</button>
+    <a class="btn btn-primary" id="downloadBtn" style="display:none;text-decoration:none" download>⬇ Download GLB</a>
+  </div>
+  <div class="status" id="status3d"></div>
 </div>
 <script>
 const dropZone = document.getElementById('dropZone');
@@ -124,8 +146,10 @@ processBtn.addEventListener('click', async () => {
     if (data.success) {
       outputImg.src = 'data:image/png;base64,' + data.image;
       outputImg.style.display = 'block';
+      processedImageB64 = data.image;
       statusEl.textContent = 'Done! Background removed.';
       statusEl.className = 'status success';
+      showStep2();
     } else {
       statusEl.textContent = 'Error: ' + (data.error || 'Unknown error');
       statusEl.className = 'status error';
@@ -138,6 +162,106 @@ processBtn.addEventListener('click', async () => {
     processBtn.disabled = false;
   }
 });
+
+// === STEP 2: 3D Generation ===
+const step2Section = document.getElementById('step2Section');
+const step2Btns = document.getElementById('step2Btns');
+const viewerPanel = document.getElementById('viewerPanel');
+const generate3dBtn = document.getElementById('generate3dBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const status3d = document.getElementById('status3d');
+let processedImageB64 = null;
+
+function showStep2() {
+  step2Section.style.display = '';
+  step2Btns.style.display = '';
+}
+
+// Patch: after successful Gemini processing, store the b64 and show step 2
+const origSuccess = 'processedImageB64';
+
+generate3dBtn.addEventListener('click', async () => {
+  if (!processedImageB64) { status3d.textContent = 'Process an image first'; status3d.className = 'status error'; return; }
+  generate3dBtn.disabled = true;
+  status3d.textContent = 'Sending to Trellis 2... this takes 30–120 seconds. Please wait.';
+  status3d.className = 'status';
+
+  try {
+    const resp = await fetch('/api/generate3d', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ image: processedImageB64 })
+    });
+    const data = await resp.json();
+    if (data.success) {
+      status3d.textContent = '3D model generated!';
+      status3d.className = 'status success';
+      downloadBtn.href = data.glb_url;
+      downloadBtn.download = data.filename;
+      downloadBtn.style.display = '';
+      viewerPanel.style.display = '';
+      loadGLBViewer(data.glb_url);
+    } else {
+      status3d.textContent = 'Error: ' + data.error;
+      status3d.className = 'status error';
+    }
+  } catch(e) {
+    status3d.textContent = 'Error: ' + e.message;
+    status3d.className = 'status error';
+  } finally {
+    generate3dBtn.disabled = false;
+  }
+});
+
+async function loadGLBViewer(url) {
+  const { Scene, PerspectiveCamera, WebGLRenderer, AmbientLight, DirectionalLight, Color, Box3, Vector3 } = await import('three');
+  const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+  const { GLTFLoader } = await import('three/addons/loaders/GLTFLoader.js');
+
+  const container = document.getElementById('viewerCanvas');
+  container.innerHTML = '';
+  const w = container.clientWidth, h = container.clientHeight;
+
+  const scene = new Scene();
+  scene.background = new Color(0x0d0d0d);
+  const camera = new PerspectiveCamera(45, w / h, 0.01, 100);
+  camera.position.set(0, 1, 3);
+
+  const renderer = new WebGLRenderer({ antialias: true });
+  renderer.setSize(w, h);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  container.appendChild(renderer.domElement);
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+
+  scene.add(new AmbientLight(0xffffff, 0.6));
+  const dir = new DirectionalLight(0xffffff, 1.2);
+  dir.position.set(2, 4, 3);
+  scene.add(dir);
+
+  const loader = new GLTFLoader();
+  loader.load(url, (gltf) => {
+    const model = gltf.scene;
+    scene.add(model);
+    const box = new Box3().setFromObject(model);
+    const center = box.getCenter(new Vector3());
+    const size = box.getSize(new Vector3()).length();
+    model.position.sub(center);
+    camera.position.set(0, size * 0.3, size * 1.5);
+    controls.target.set(0, 0, 0);
+    controls.update();
+  });
+
+  function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
+  animate();
+
+  window.addEventListener('resize', () => {
+    const nw = container.clientWidth, nh = container.clientHeight;
+    camera.aspect = nw / nh; camera.updateProjectionMatrix();
+    renderer.setSize(nw, nh);
+  });
+}
 </script>
 </body>
 </html>
