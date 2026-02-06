@@ -17,21 +17,8 @@
   .panels { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
   .panel { background: #141414; border: 1px solid #222; border-radius: 12px; padding: 20px; min-height: 400px; display: flex; flex-direction: column; }
   .panel-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 16px; }
-  .drop-zone { flex: 1; border: 2px dashed #333; border-radius: 8px; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s; position: relative; overflow: hidden; }
-  .drop-zone:hover, .drop-zone.drag-over { border-color: #4f9eff; background: rgba(79,158,255,0.05); }
-  .drop-zone.has-image { border-style: solid; border-color: #333; }
-  .drop-zone img { max-width: 100%; max-height: 100%; object-fit: contain; }
-  .drop-text { text-align: center; color: #555; }
-  .drop-text svg { display: block; margin: 0 auto 12px; }
-  .drop-text p { font-size: 14px; }
-  .drop-text span { font-size: 12px; color: #444; }
-  input[type="file"] { display: none; }
-  .output-area { flex: 1; border-radius: 8px; background: #0d0d0d; display: flex; align-items: center; justify-content: center; overflow: hidden; }
-  .output-area img { max-width: 100%; max-height: 100%; object-fit: contain; }
-  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 28px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; margin-top: 16px; }
-  .btn-primary { background: #4f9eff; color: #fff; }
-  .btn-primary:hover { background: #3a8fee; }
-  .btn-primary:disabled { background: #333; color: #666; cursor: not-allowed; }
+  .image-box { flex: 1; border-radius: 8px; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #0d0d0d; }
+  .image-box img { max-width: 100%; max-height: 100%; object-fit: contain; }
   .prompt-section { margin-top: 24px; }
   .prompt-label { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 8px; }
   .prompt-field { width: 100%; min-height: 100px; padding: 14px; background: #141414; border: 1px solid #222; border-radius: 8px; color: #e0e0e0; font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical; outline: none; transition: border-color 0.2s; }
@@ -44,6 +31,10 @@
   .viewer-canvas { width: 100%; height: 500px; border-radius: 8px; background: #0d0d0d; position: relative; }
   .viewer-canvas canvas { border-radius: 8px; }
   .btn-row { display: flex; justify-content: center; gap: 12px; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 28px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.15s; margin-top: 16px; }
+  .btn-primary { background: #4f9eff; color: #fff; }
+  .btn-primary:hover { background: #3a8fee; }
+  .btn-primary:disabled { background: #333; color: #666; cursor: not-allowed; }
   .spinner { display: none; width: 32px; height: 32px; border: 3px solid #333; border-top-color: #4f9eff; border-radius: 50%; animation: spin 0.8s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
   .status { text-align: center; font-size: 13px; color: #888; margin-top: 12px; min-height: 20px; }
@@ -54,38 +45,37 @@
 </head>
 <body>
 <div class="header">
-  <h1>🧑‍🎨 Avatar Pipeline — Step 1</h1>
-  <p>Upload a character image → Gemini removes background → Clean image for 3D generation</p>
+  <h1>🧑‍🎨 Avatar Pipeline</h1>
+  <p>Base character → Gemini customization → 3D model generation</p>
 </div>
 <div class="container">
+  <!-- Step 1: Gemini Processing -->
   <div class="panels">
     <div class="panel">
-      <div class="panel-title">Input Image</div>
-      <div class="drop-zone" id="dropZone">
-        <div class="drop-text" id="dropText">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.5"><path d="M12 16V4m0 0l-4 4m4-4l4 4"/><path d="M2 17l.621 2.485A2 2 0 004.561 21h14.878a2 2 0 001.94-1.515L22 17"/></svg>
-          <p>Drop image here or click to upload</p>
-          <span>PNG, JPG, WEBP</span>
-        </div>
+      <div class="panel-title">Base Character</div>
+      <div class="image-box">
+        <img src="/base_character.png" alt="Base character">
       </div>
-      <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp">
     </div>
     <div class="panel">
-      <div class="panel-title">Processed Output</div>
-      <div class="output-area" id="outputArea">
+      <div class="panel-title">Gemini Output</div>
+      <div class="image-box" id="outputArea">
         <div class="spinner" id="spinner"></div>
         <img id="outputImg" style="display:none">
       </div>
     </div>
   </div>
+
   <div class="prompt-section">
     <div class="prompt-label">Gemini Prompt</div>
     <textarea class="prompt-field" id="promptField" placeholder="Instructions for Gemini image processing...">Edit this image: Remove the entire background and replace it with a plain solid white background. Keep the character exactly as they are — same pose, same proportions, same details, same colors. Do not change, crop, or alter the character in any way. The output should be the full character cleanly isolated on a pure white (#FFFFFF) background, suitable as input for an AI 3D model generator.</textarea>
   </div>
   <div class="btn-row">
-    <button class="btn btn-primary" id="processBtn" disabled>⚡ Process with Gemini</button>
+    <button class="btn btn-primary" id="processBtn">⚡ Process with Gemini</button>
   </div>
   <div class="status" id="status"></div>
+
+  <!-- Step 2: 3D Generation -->
   <div class="step-divider" id="step2Section" style="display:none">
     <h2>🪩 Step 2 — 3D Model Generation</h2>
     <p>Send processed image to Trellis 2 (Microsoft) to generate a 3D model</p>
@@ -100,54 +90,36 @@
   </div>
   <div class="status" id="status3d"></div>
 </div>
+
 <script>
-const dropZone = document.getElementById('dropZone');
-const fileInput = document.getElementById('fileInput');
-const dropText = document.getElementById('dropText');
 const processBtn = document.getElementById('processBtn');
 const spinner = document.getElementById('spinner');
 const outputImg = document.getElementById('outputImg');
 const statusEl = document.getElementById('status');
-let selectedFile = null;
-
-dropZone.addEventListener('click', () => fileInput.click());
-dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
-dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('drag-over'); handleFile(e.dataTransfer.files[0]); });
-fileInput.addEventListener('change', () => handleFile(fileInput.files[0]));
-
-function handleFile(file) {
-  if (!file || !file.type.startsWith('image/')) return;
-  selectedFile = file;
-  const url = URL.createObjectURL(file);
-  dropZone.classList.add('has-image');
-  dropZone.innerHTML = `<img src="${url}">`;
-  processBtn.disabled = false;
-  outputImg.style.display = 'none';
-  statusEl.textContent = '';
-  statusEl.className = 'status';
-}
+let processedImageB64 = null;
 
 processBtn.addEventListener('click', async () => {
-  if (!selectedFile) return;
   processBtn.disabled = true;
   spinner.style.display = 'block';
   outputImg.style.display = 'none';
   statusEl.textContent = 'Sending to Gemini...';
   statusEl.className = 'status';
 
-  const formData = new FormData();
-  formData.append('image', selectedFile);
-  formData.append('prompt', document.getElementById('promptField').value);
-
   try {
+    // Fetch the base image as blob and send it
+    const imgResp = await fetch('/base_character.png');
+    const blob = await imgResp.blob();
+    const formData = new FormData();
+    formData.append('image', blob, 'base_character.png');
+    formData.append('prompt', document.getElementById('promptField').value);
+
     const resp = await fetch('/api/process', { method: 'POST', body: formData });
     const data = await resp.json();
     if (data.success) {
       outputImg.src = 'data:image/png;base64,' + data.image;
       outputImg.style.display = 'block';
       processedImageB64 = data.image;
-      statusEl.textContent = 'Done! Background removed.';
+      statusEl.textContent = 'Done! Image processed.';
       statusEl.className = 'status success';
       showStep2();
     } else {
@@ -170,20 +142,16 @@ const viewerPanel = document.getElementById('viewerPanel');
 const generate3dBtn = document.getElementById('generate3dBtn');
 const downloadBtn = document.getElementById('downloadBtn');
 const status3d = document.getElementById('status3d');
-let processedImageB64 = null;
 
 function showStep2() {
   step2Section.style.display = '';
   step2Btns.style.display = '';
 }
 
-// Patch: after successful Gemini processing, store the b64 and show step 2
-const origSuccess = 'processedImageB64';
-
 generate3dBtn.addEventListener('click', async () => {
   if (!processedImageB64) { status3d.textContent = 'Process an image first'; status3d.className = 'status error'; return; }
   generate3dBtn.disabled = true;
-  status3d.textContent = 'Sending to Trellis 2... this takes 30–120 seconds. Please wait.';
+  status3d.textContent = 'Sending to Trellis 2... this takes 30\u2013120 seconds. Please wait.';
   status3d.className = 'status';
 
   try {
