@@ -84,7 +84,7 @@
   <!-- Step 2: 3D Generation -->
   <div class="step-divider" id="step2Section">
     <h2>🪩 Step 2 — Generate Rigged 3D Avatar</h2>
-    <p>Rodin 3D generation → Scale → Rig transfer → FBX + .blend</p>
+    <p>Rodin 3D → Scale → Retopology → Rig transfer → FBX + .blend</p>
   </div>
   <div class="viewer-panel" id="viewerPanel" style="display:none">
     <div class="panel-title">3D Preview</div>
@@ -221,6 +221,7 @@ generate3dBtn.addEventListener('click', async () => {
         generating: '🪩 Generating 3D mesh (20–60s)...',
         downloading: '⬇️ Downloading mesh from Rodin...',
         scaling: '📏 Scaling mesh to match image...',
+        retopology: '🔷 Retopologizing mesh (quad remesh)...',
         rigging: '🦴 Transferring skeleton & skin weights...',
         saving_blend: '🟠 Saving comparison .blend...',
         done: '✅ Done!', error: '❌ Error'

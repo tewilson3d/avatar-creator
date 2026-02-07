@@ -199,7 +199,29 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             scaled_glb = raw_glb
 
         # =====================================================================
-        # Phase 3: Rig Transfer
+        # Phase 3: Retopology
+        # =====================================================================
+        retopo_glb = MODELS_DIR / f"job{job_id}_retopo.glb"
+
+        print(f"[Job {job_id}] Retopologizing mesh...")
+        jobs[job_id]["status"] = "retopology"
+        import subprocess as _sp
+        retopo_cmd = [
+            sys.executable, str(SCRIPTS_DIR / "step4_retopo.py"),
+            str(scaled_glb), str(retopo_glb),
+            "--faces", "5000", "--method", "instant"
+        ]
+        print(f"[Job {job_id} Retopo] Running: {' '.join(retopo_cmd)}")
+        retopo_result = _sp.run(retopo_cmd, capture_output=True, text=True, timeout=300)
+        print(retopo_result.stdout[-1000:] if retopo_result.stdout else "")
+        if retopo_result.returncode != 0 or not retopo_glb.exists():
+            print(f"[Job {job_id}] Retopo failed, using scaled mesh: {retopo_result.stderr[-500:] if retopo_result.stderr else ''}")
+            retopo_glb = scaled_glb
+        else:
+            print(f"[Job {job_id}] Retopo done: {retopo_glb}")
+
+        # =====================================================================
+        # Phase 4: Rig Transfer
         # =====================================================================
         rig_path = TEMPLATES_DIR / "rig.fbx"
         rigged_fbx = OUTPUT_DIR / f"job{job_id}_rigged.fbx"
@@ -207,13 +229,13 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
         print(f"[Job {job_id}] Transferring rig...")
         jobs[job_id]["status"] = "rigging"
         ok, msg = run_blender_script("step5_rig_transfer.py",
-            [str(scaled_glb), str(rig_path), str(rigged_fbx)],
+            [str(retopo_glb), str(rig_path), str(rigged_fbx)],
             label=f"Job {job_id} Rig")
         if not ok:
             raise Exception(f"Rig transfer failed: {msg}")
 
         # =====================================================================
-        # Phase 4: Comparison .blend
+        # Phase 5: Comparison .blend
         # =====================================================================
         comparison_blend = OUTPUT_DIR / f"job{job_id}_comparison.blend"
 
