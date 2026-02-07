@@ -32,7 +32,9 @@ OUTPUT_DIR = Path(__file__).parent.parent / "output"
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
 MODEL = "gemini-3-pro-image-preview"
+RODIN_BASE_URL = "https://api.hyper3d.com/api/v2"
 
 PROMPT = (
     "Edit this image: Remove the entire background and replace it with a plain solid white background. "
@@ -83,61 +85,100 @@ def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[b
     return False, "Gemini returned no image"
 
 
-def generate_3d_trellis(image_bytes: bytes, job_id: str):
-    """Run Trellis 2 in background thread. Updates jobs[job_id]."""
+def _rodin_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
+    """Build multipart/form-data body."""
+    import uuid as _uuid
+    boundary = f"----PipelineBoundary{_uuid.uuid4().hex}"
+    body = b""
+    for key, value in fields.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode()
+    for key, (filename, data, mime) in files.items():
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n".encode()
+        body += data + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def generate_3d_rodin(image_bytes: bytes, job_id: str):
+    """Run Rodin Sketch (Gen-1) in background thread. Updates jobs[job_id]."""
     try:
-        from gradio_client import Client, handle_file
-        import tempfile
-        import shutil
+        # 1. Submit task
+        print(f"[Job {job_id}] Submitting to Rodin Sketch...")
+        jobs[job_id]["status"] = "submitting"
 
-        tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-        tmp_img.write(image_bytes)
-        tmp_img.close()
+        fields = {"tier": "Sketch", "geometry_file_format": "glb", "material": "PBR"}
+        files_data = {"images": ("character.png", image_bytes, "image/png")}
+        body, content_type = _rodin_multipart(fields, files_data)
 
-        try:
-            print(f"[Job {job_id}] Connecting to Trellis 2...")
-            jobs[job_id]["status"] = "connecting"
-            client = Client("microsoft/TRELLIS.2")
+        req = urllib.request.Request(
+            f"{RODIN_BASE_URL}/rodin", data=body,
+            headers={"Authorization": f"Bearer {RODIN_API_KEY}", "Content-Type": content_type},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
 
-            print(f"[Job {job_id}] Starting session...")
-            jobs[job_id]["status"] = "starting"
-            client.predict(api_name="/start_session")
+        if result.get("error"):
+            raise Exception(f"Rodin error: {result['error']} - {result.get('message', '')}")
 
-            print(f"[Job {job_id}] Preprocessing image...")
-            jobs[job_id]["status"] = "preprocessing"
-            processed = client.predict(input=handle_file(tmp_img.name), api_name="/preprocess_image")
+        task_uuid = result["uuid"]
+        subscription_key = result["jobs"]["subscription_key"]
+        print(f"[Job {job_id}] Task UUID: {task_uuid}")
 
-            seed = client.predict(randomize_seed=True, seed=0, api_name="/get_seed")
-            print(f"[Job {job_id}] Seed: {seed}")
-
-            print(f"[Job {job_id}] Generating 3D model...")
-            jobs[job_id]["status"] = "generating"
-            client.predict(
-                image=processed, seed=seed, resolution="512",
-                ss_guidance_strength=7.5, ss_guidance_rescale=0.7,
-                ss_sampling_steps=12, ss_rescale_t=5.0,
-                shape_slat_guidance_strength=7.5, shape_slat_guidance_rescale=0.5,
-                shape_slat_sampling_steps=12, shape_slat_rescale_t=3.0,
-                tex_slat_guidance_strength=1.0, tex_slat_guidance_rescale=0.0,
-                tex_slat_sampling_steps=12, tex_slat_rescale_t=3.0,
-                api_name="/image_to_3d"
+        # 2. Poll status
+        jobs[job_id]["status"] = "generating"
+        start = time.time()
+        while time.time() - start < 300:
+            time.sleep(5)
+            req = urllib.request.Request(
+                f"{RODIN_BASE_URL}/status",
+                data=json.dumps({"subscription_key": subscription_key}).encode(),
+                headers={"Authorization": f"Bearer {RODIN_API_KEY}", "Content-Type": "application/json"},
+                method="POST"
             )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status_result = json.loads(resp.read())
 
-            print(f"[Job {job_id}] Extracting GLB...")
-            jobs[job_id]["status"] = "extracting"
-            result = client.predict(decimation_target=300000, texture_size=2048, api_name="/extract_glb")
+            job_list = status_result.get("jobs", [])
+            for j in job_list:
+                elapsed = int(time.time() - start)
+                print(f"  [{elapsed}s] Job {j['uuid']}: {j['status']}")
 
-            glb_source = result[0] if isinstance(result, (list, tuple)) else result
-            MODELS_DIR.mkdir(parents=True, exist_ok=True)
-            glb_dest = MODELS_DIR / f"trellis_{job_id}.glb"
-            shutil.copy2(glb_source, glb_dest)
+            if job_list and all(j["status"] in ("Done", "Failed") for j in job_list):
+                if any(j["status"] == "Failed" for j in job_list):
+                    raise Exception("Rodin job failed")
+                break
+        else:
+            raise Exception("Rodin timed out after 300s")
 
-            print(f"[Job {job_id}] Done! {glb_dest}")
-            jobs[job_id]["status"] = "done"
-            jobs[job_id]["result"] = {"glb_url": f"/models/{glb_dest.name}", "filename": glb_dest.name}
+        # 3. Download
+        print(f"[Job {job_id}] Downloading results...")
+        jobs[job_id]["status"] = "downloading"
+        req = urllib.request.Request(
+            f"{RODIN_BASE_URL}/download",
+            data=json.dumps({"task_uuid": task_uuid}).encode(),
+            headers={"Authorization": f"Bearer {RODIN_API_KEY}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            dl_result = json.loads(resp.read())
 
-        finally:
-            os.unlink(tmp_img.name)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        glb_dest = None
+        for item in dl_result.get("list", []):
+            name = item["name"]
+            dest = MODELS_DIR / f"rodin_{job_id}_{name}"
+            urllib.request.urlretrieve(item["url"], str(dest))
+            print(f"  Downloaded: {dest}")
+            if name.endswith(".glb"):
+                glb_dest = dest
+
+        if not glb_dest:
+            raise Exception("No GLB file in Rodin output")
+
+        print(f"[Job {job_id}] Done! {glb_dest}")
+        jobs[job_id]["status"] = "done"
+        jobs[job_id]["result"] = {"glb_url": f"/models/{glb_dest.name}", "filename": glb_dest.name}
 
     except Exception as e:
         import traceback
@@ -288,7 +329,7 @@ class Handler(SimpleHTTPRequestHandler):
             job_id = str(job_counter)
 
         jobs[job_id] = {"status": "queued"}
-        thread = threading.Thread(target=generate_3d_trellis, args=(image_bytes, job_id), daemon=True)
+        thread = threading.Thread(target=generate_3d_rodin, args=(image_bytes, job_id), daemon=True)
         thread.start()
 
         self._json_response({"success": True, "job_id": job_id})
@@ -382,9 +423,10 @@ class Handler(SimpleHTTPRequestHandler):
         # Reload into environment
         for k, v in entries.items():
             os.environ[k] = v
-        # Update the global API key
-        global GEMINI_API_KEY
+        # Update global API keys
+        global GEMINI_API_KEY, RODIN_API_KEY
         GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+        RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
         self._json_response({"success": True})
 
     def _serve_admin(self):
