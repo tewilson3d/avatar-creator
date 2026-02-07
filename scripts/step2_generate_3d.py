@@ -1,119 +1,178 @@
 #!/usr/bin/env python3
-"""Step 2: Generate 3D model from processed image
+"""Step 2: Generate 3D model from processed image using Rodin Sketch (Gen-1)
 
-Tries multiple backends in order:
-1. Rodin (Hyper Human) - if RODIN_API_KEY set
-2. Hunyuan3D - if HUNYUAN_API_KEY set  
-3. Trellis (local/API) - fallback
+Uses the Hyper3D Rodin API (free tier = Sketch).
+API docs: https://developer.hyper3d.ai/
+
+Requires RODIN_API_KEY environment variable.
+
+Flow:
+  1. POST /api/v2/rodin  (multipart/form-data, tier=Sketch) → uuid + subscription_key
+  2. POST /api/v2/status  (poll with subscription_key until Done)
+  3. POST /api/v2/download (get download URLs by task_uuid)
 """
 import sys
 import os
 import json
-import base64
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 
+BASE_URL = "https://api.hyper3d.com/api/v2"
 
-def generate_with_rodin(image_path: str, output_path: str):
-    """Generate 3D model using Rodin API (Hyper Human)"""
-    api_key = os.environ.get("RODIN_API_KEY")
-    if not api_key:
-        return False
 
-    print("Using Rodin API for 3D generation...")
+def make_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
+    """Build multipart/form-data body. Returns (body_bytes, content_type)."""
+    import uuid as _uuid
+    boundary = f"----PipelineBoundary{_uuid.uuid4().hex}"
+    parts = []
+
+    for key, value in fields.items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+            f"{value}\r\n"
+        )
+
+    for key, (filename, data, mime) in files.items():
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="{key}"; filename="{filename}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        )
+        # We need to handle binary data specially
+        parts.append(None)  # placeholder for binary
+        parts.append(data)
+        parts.append(b"\r\n")
+
+    closing = f"--{boundary}--\r\n"
+
+    # Assemble
+    body = b""
+    for part in parts:
+        if part is None:
+            continue
+        elif isinstance(part, bytes):
+            body += part
+        else:
+            body += part.encode("utf-8")
+    body += closing.encode("utf-8")
+
+    content_type = f"multipart/form-data; boundary={boundary}"
+    return body, content_type
+
+
+def submit_task(api_key: str, image_path: str) -> dict:
+    """Submit image-to-3D generation task with Sketch tier."""
+    url = f"{BASE_URL}/rodin"
 
     with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
+        image_data = f.read()
 
-    # Submit generation job
-    url = "https://hyperhuman.deemos.com/api/v2/rodin"
-    payload = {
-        "images": [image_data],
-        "input_type": "image",
-        "output_format": "glb",
+    filename = os.path.basename(image_path)
+    ext = Path(image_path).suffix.lower()
+    mime = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".webp": "image/webp",
+    }.get(ext, "image/png")
+
+    fields = {
+        "tier": "Sketch",
+        "geometry_file_format": "glb",
+        "material": "PBR",
     }
+    files = {
+        "images": (filename, image_data, mime),
+    }
+
+    body, content_type = make_multipart(fields, files)
+
     req = urllib.request.Request(
         url,
-        data=json.dumps(payload).encode(),
+        data=body,
         headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": content_type,
         },
-        method="POST"
+        method="POST",
     )
 
-    print("Submitting to Rodin...")
+    print(f"Submitting to Rodin Sketch (Gen-1)...")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        result = json.loads(resp.read())
+
+    if result.get("error"):
+        print(f"Rodin error: {result['error']} - {result.get('message', '')}")
+        sys.exit(1)
+
+    print(f"  Task UUID: {result['uuid']}")
+    print(f"  Jobs: {result['jobs']['uuids']}")
+    return result
+
+
+def poll_status(api_key: str, subscription_key: str, timeout_sec: int = 300) -> bool:
+    """Poll task status until all jobs are Done or Failed."""
+    url = f"{BASE_URL}/status"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = json.dumps({"subscription_key": subscription_key}).encode()
+
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        time.sleep(5)
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+
+        jobs = result.get("jobs", [])
+        for j in jobs:
+            elapsed = int(time.time() - start)
+            print(f"  [{elapsed}s] Job {j['uuid']}: {j['status']}")
+
+        if all(j["status"] in ("Done", "Failed") for j in jobs) and jobs:
+            if any(j["status"] == "Failed" for j in jobs):
+                print("ERROR: One or more jobs failed.")
+                return False
+            return True
+
+    print(f"ERROR: Timed out after {timeout_sec}s")
+    return False
+
+
+def download_results(api_key: str, task_uuid: str, output_dir: str) -> list[str]:
+    """Download generated files. Returns list of downloaded paths."""
+    url = f"{BASE_URL}/download"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = json.dumps({"task_uuid": task_uuid}).encode()
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=30) as resp:
         result = json.loads(resp.read())
 
-    task_uuid = result.get("uuid")
-    if not task_uuid:
-        print(f"Rodin error: {result}")
-        return False
+    items = result.get("list", [])
+    if not items:
+        print("ERROR: No files in download response.")
+        return []
 
-    # Poll for completion
-    status_url = f"https://hyperhuman.deemos.com/api/v2/rodin/status/{task_uuid}"
-    print(f"Task submitted: {task_uuid}")
+    os.makedirs(output_dir, exist_ok=True)
+    downloaded = []
+    for item in items:
+        name = item["name"]
+        file_url = item["url"]
+        dest = os.path.join(output_dir, name)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        print(f"  Downloading {name}...")
+        urllib.request.urlretrieve(file_url, dest)
+        downloaded.append(dest)
+        print(f"    → {dest}")
 
-    for attempt in range(120):  # Up to 10 minutes
-        time.sleep(5)
-        req = urllib.request.Request(
-            status_url,
-            headers={"Authorization": f"Bearer {api_key}"}
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            status = json.loads(resp.read())
-
-        state = status.get("status", "unknown")
-        print(f"  Status: {state} ({attempt * 5}s)")
-
-        if state == "done":
-            # Download the model
-            download_url = status.get("output", {}).get("model", "")
-            if download_url:
-                urllib.request.urlretrieve(download_url, output_path)
-                print(f"Model saved: {output_path}")
-                return True
-            print("No download URL in response")
-            return False
-        elif state == "failed":
-            print(f"Generation failed: {status}")
-            return False
-
-    print("Timed out waiting for Rodin")
-    return False
-
-
-def generate_with_trellis(image_path: str, output_path: str):
-    """Generate 3D model using Trellis (Gradio Space or local)"""
-    trellis_url = os.environ.get("TRELLIS_API_URL")
-    if not trellis_url:
-        return False
-
-    print(f"Using Trellis at {trellis_url}...")
-
-    try:
-        # pip install gradio_client if needed
-        from gradio_client import Client, handle_file
-        client = Client(trellis_url)
-        result = client.predict(
-            image=handle_file(image_path),
-            api_name="/image_to_3d"
-        )
-        # Result is typically a file path
-        import shutil
-        if isinstance(result, str) and Path(result).exists():
-            shutil.copy2(result, output_path)
-            print(f"Model saved: {output_path}")
-            return True
-        elif isinstance(result, dict) and "value" in result:
-            shutil.copy2(result["value"], output_path)
-            return True
-    except Exception as e:
-        print(f"Trellis error: {e}")
-
-    return False
+    return downloaded
 
 
 def main():
@@ -123,26 +182,50 @@ def main():
 
     image_path = sys.argv[1]
     output_path = sys.argv[2]
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Try backends in order
-    backends = [
-        ("Rodin", generate_with_rodin),
-        ("Trellis", generate_with_trellis),
-    ]
+    if not os.path.exists(image_path):
+        print(f"Input image not found: {image_path}")
+        sys.exit(1)
 
-    for name, fn in backends:
-        print(f"\nTrying {name}...")
-        try:
-            if fn(image_path, output_path):
-                print(f"\n3D generation complete via {name}")
-                return
-        except Exception as e:
-            print(f"{name} failed: {e}")
+    api_key = os.environ.get("RODIN_API_KEY")
+    if not api_key:
+        print("ERROR: RODIN_API_KEY environment variable not set.")
+        print("Get a free API key at https://hyper3d.ai/")
+        sys.exit(1)
 
-    print("\nERROR: No 3D generation backend available.")
-    print("Set one of: RODIN_API_KEY, TRELLIS_API_URL")
-    sys.exit(1)
+    # 1. Submit task
+    task = submit_task(api_key, image_path)
+    task_uuid = task["uuid"]
+    subscription_key = task["jobs"]["subscription_key"]
+
+    # 2. Poll until done (~20s for Sketch)
+    print("\nPolling for completion...")
+    if not poll_status(api_key, subscription_key, timeout_sec=300):
+        sys.exit(1)
+
+    # 3. Download results
+    print("\nDownloading results...")
+    output_dir = str(Path(output_path).parent)
+    downloaded = download_results(api_key, task_uuid, output_dir)
+
+    if not downloaded:
+        sys.exit(1)
+
+    # Find the GLB file and copy/rename to output_path
+    glb_files = [f for f in downloaded if f.endswith(".glb")]
+    if glb_files:
+        import shutil
+        src = glb_files[0]
+        if src != output_path:
+            shutil.copy2(src, output_path)
+        print(f"\n✓ 3D model saved: {output_path}")
+    else:
+        # If no GLB, just use the first file
+        print(f"\nWarning: No .glb found. Downloaded: {downloaded}")
+        if downloaded:
+            import shutil
+            shutil.copy2(downloaded[0], output_path)
+            print(f"  Copied {downloaded[0]} → {output_path}")
 
 
 if __name__ == "__main__":
