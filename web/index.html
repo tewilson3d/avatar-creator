@@ -73,8 +73,9 @@
   </div>
 
   <div class="prompt-section">
-    <div class="prompt-label">Gemini Prompt</div>
-    <textarea class="prompt-field" id="promptField" placeholder="Instructions for Gemini image processing...">Edit this image: Remove the entire background and replace it with a plain solid white background. Keep the character exactly as they are — same pose, same proportions, same details, same colors. Do not change, crop, or alter the character in any way. The output should be the full character cleanly isolated on a pure white (#FFFFFF) background, suitable as input for an AI 3D model generator.</textarea>
+    <div class="prompt-label">Character Changes</div>
+    <div id="prefixDisplay" style="font-size:12px;color:#555;margin-bottom:8px;font-style:italic;line-height:1.4"></div>
+    <textarea class="prompt-field" id="promptField" placeholder="e.g. wearing a red cape and armor, with elf ears and blue skin..."></textarea>
   </div>
   <div class="btn-row">
     <button class="btn btn-primary" id="processBtn">⚡ Process with Gemini</button>
@@ -121,6 +122,17 @@ const spinner = document.getElementById('spinner');
 const outputImg = document.getElementById('outputImg');
 const statusEl = document.getElementById('status');
 let processedImageB64 = null;
+
+// Load and display prompt prefix
+(async () => {
+  try {
+    const resp = await fetch('/api/admin/prompt-prefix');
+    const data = await resp.json();
+    if (data.prefix) {
+      document.getElementById('prefixDisplay').textContent = 'Prefix: "' + data.prefix + '"';
+    }
+  } catch(e) {}
+})();
 
 processBtn.addEventListener('click', async () => {
   processBtn.disabled = true;

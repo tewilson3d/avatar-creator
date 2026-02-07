@@ -36,13 +36,10 @@ RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
 MODEL = "gemini-3-pro-image-preview"
 RODIN_BASE_URL = "https://api.hyper3d.com/api/v2"
 
-PROMPT = (
-    "Edit this image: Remove the entire background and replace it with a plain solid white background. "
-    "Keep the character exactly as they are — same pose, same proportions, same details, same colors. "
-    "Do not change, crop, or alter the character in any way. "
-    "The output should be the full character cleanly isolated on a pure white (#FFFFFF) background, "
-    "suitable as input for an AI 3D model generator."
+DEFAULT_GEMINI_PROMPT_PREFIX = (
+    "keep the exact same style, proportions and pose, please change the character to look the following, but do not add a face:"
 )
+GEMINI_PROMPT_PREFIX = os.environ.get("GEMINI_PROMPT_PREFIX", DEFAULT_GEMINI_PROMPT_PREFIX)
 
 # Async job tracking
 jobs = {}  # job_id -> {"status": "running"|"done"|"error", "result": ..., "error": ...}
@@ -53,7 +50,7 @@ job_lock = threading.Lock()
 def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[bool, str]:
     """Send image to Gemini, return (success, base64_image_or_error)."""
     image_b64 = base64.b64encode(image_bytes).decode()
-    text = prompt.strip() if prompt.strip() else PROMPT
+    text = prompt.strip() if prompt.strip() else GEMINI_PROMPT_PREFIX
 
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/"
@@ -324,6 +321,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_list_outputs()
         if self.path == "/api/admin/config":
             return self._handle_get_config()
+        if self.path == "/api/admin/prompt-prefix":
+            return self._handle_get_prompt_prefix()
         if self.path == "/admin":
             return self._serve_admin()
         if self.path.startswith("/api/job/"):
@@ -344,6 +343,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_generate_blend()
         if self.path == "/api/admin/config":
             return self._handle_save_config()
+        if self.path == "/api/admin/prompt-prefix":
+            return self._handle_save_prompt_prefix()
         self.send_error(404)
 
     def _handle_process(self):
@@ -378,9 +379,14 @@ class Handler(SimpleHTTPRequestHandler):
             self._json_response({"success": False, "error": "No image in request"})
             return
 
+        # Build final prompt: prefix + user input
+        if prompt.strip():
+            final_prompt = GEMINI_PROMPT_PREFIX + " " + prompt.strip()
+        else:
+            final_prompt = GEMINI_PROMPT_PREFIX
         print(f"Processing image: {len(image_bytes)} bytes, {mime_type}")
-        print(f"Prompt: {prompt[:100]}..." if len(prompt) > 100 else f"Prompt: {prompt}")
-        success, result = call_gemini(image_bytes, mime_type, prompt)
+        print(f"Final prompt: {final_prompt[:200]}..." if len(final_prompt) > 200 else f"Final prompt: {final_prompt}")
+        success, result = call_gemini(image_bytes, mime_type, final_prompt)
 
         if success:
             self._json_response({"success": True, "image": result})
@@ -493,6 +499,8 @@ class Handler(SimpleHTTPRequestHandler):
         # Return with masked values for display, full values for editing
         items = []
         for k, v in config.items():
+            if k == "GEMINI_PROMPT_PREFIX":
+                continue  # Managed via dedicated prompt-prefix endpoint
             masked = v[:8] + '...' + v[-4:] if len(v) > 16 else '****'
             items.append({"key": k, "value": v, "masked": masked})
         self._json_response({"config": items})
@@ -514,6 +522,39 @@ class Handler(SimpleHTTPRequestHandler):
         global GEMINI_API_KEY, RODIN_API_KEY
         GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
         RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
+        self._json_response({"success": True})
+
+    def _handle_get_prompt_prefix(self):
+        """Return current Gemini prompt prefix."""
+        self._json_response({"prefix": GEMINI_PROMPT_PREFIX})
+
+    def _handle_save_prompt_prefix(self):
+        """Save Gemini prompt prefix to .env and update in-memory."""
+        global GEMINI_PROMPT_PREFIX
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        new_prefix = data.get("prefix", "").strip()
+        if not new_prefix:
+            self._json_response({"success": False, "error": "Prefix cannot be empty"})
+            return
+        GEMINI_PROMPT_PREFIX = new_prefix
+        os.environ["GEMINI_PROMPT_PREFIX"] = new_prefix
+        # Update .env file
+        if ENV_FILE.exists():
+            lines = ENV_FILE.read_text().splitlines()
+            found = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith("GEMINI_PROMPT_PREFIX="):
+                    lines[i] = f"GEMINI_PROMPT_PREFIX={new_prefix}"
+                    found = True
+                    break
+            if not found:
+                lines.append(f"GEMINI_PROMPT_PREFIX={new_prefix}")
+            ENV_FILE.write_text('\n'.join(lines) + '\n')
+        else:
+            ENV_FILE.write_text(f"GEMINI_PROMPT_PREFIX={new_prefix}\n")
+        print(f"Updated GEMINI_PROMPT_PREFIX: {new_prefix[:80]}...")
         self._json_response({"success": True})
 
     def _serve_admin(self):
