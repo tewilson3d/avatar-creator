@@ -73,11 +73,12 @@ def main():
         "--", str(raw_model), str(scaled_model), str(processed_image)
     ])
 
-    # Step 4: Retopology via QuadRemesher VM
+    # Step 4: Retopology via Instant Meshes
     if not args.skip_retopo:
-        run_step("Retopology (QuadRemesher)", [
+        run_step("Retopology (Instant Meshes)", [
             sys.executable, str(SCRIPTS / "step4_retopo.py"),
-            str(scaled_model), str(retopo_model)
+            str(scaled_model), str(retopo_model),
+            "--faces", "5000", "--method", "instant"
         ])
     else:
         retopo_model = scaled_model
