@@ -199,23 +199,17 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             scaled_glb = raw_glb
 
         # =====================================================================
-        # Phase 3: Retopology
+        # Phase 3: Retopology (Blender QuadriFlow)
         # =====================================================================
         retopo_glb = MODELS_DIR / f"job{job_id}_retopo.glb"
 
-        print(f"[Job {job_id}] Retopologizing mesh...")
+        print(f"[Job {job_id}] Retopologizing mesh (QuadriFlow)...")
         jobs[job_id]["status"] = "retopology"
-        import subprocess as _sp
-        retopo_cmd = [
-            sys.executable, str(SCRIPTS_DIR / "step4_retopo.py"),
-            str(scaled_glb), str(retopo_glb),
-            "--faces", "5000", "--method", "instant"
-        ]
-        print(f"[Job {job_id} Retopo] Running: {' '.join(retopo_cmd)}")
-        retopo_result = _sp.run(retopo_cmd, capture_output=True, text=True, timeout=300)
-        print(retopo_result.stdout[-1000:] if retopo_result.stdout else "")
-        if retopo_result.returncode != 0 or not retopo_glb.exists():
-            print(f"[Job {job_id}] Retopo failed, using scaled mesh: {retopo_result.stderr[-500:] if retopo_result.stderr else ''}")
+        ok, msg = run_blender_script("step4_retopo.py",
+            [str(scaled_glb), str(retopo_glb), "--faces", "5000"],
+            label=f"Job {job_id} Retopo")
+        if not ok or not retopo_glb.exists():
+            print(f"[Job {job_id}] Retopo failed, using scaled mesh")
             retopo_glb = scaled_glb
         else:
             print(f"[Job {job_id}] Retopo done: {retopo_glb}")
