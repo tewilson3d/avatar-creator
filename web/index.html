@@ -83,16 +83,18 @@
 
   <!-- Step 2: 3D Generation -->
   <div class="step-divider" id="step2Section">
-    <h2>🪩 Step 2 — 3D Model Generation</h2>
-    <p>Send processed image to Rodin Sketch (Hyper3D) to generate a 3D model</p>
+    <h2>🪩 Step 2 — Generate Rigged 3D Avatar</h2>
+    <p>Rodin 3D generation → Scale → Rig transfer → FBX + .blend</p>
   </div>
   <div class="viewer-panel" id="viewerPanel" style="display:none">
     <div class="panel-title">3D Preview</div>
     <div class="viewer-canvas" id="viewerCanvas"></div>
   </div>
   <div class="btn-row" id="step2Btns">
-    <button class="btn btn-primary" id="generate3dBtn">🪩 Generate 3D with Rodin</button>
+    <button class="btn btn-primary" id="generate3dBtn">🪩 Generate Rigged Avatar</button>
     <a class="btn btn-primary" id="downloadBtn" style="display:none;text-decoration:none" download>⬇ Download GLB</a>
+    <a class="btn btn-primary" id="downloadFbxBtn" style="display:none;text-decoration:none" download>📦 Download FBX</a>
+    <a class="btn btn-primary" id="downloadBlendBtn" style="display:none;text-decoration:none" download>🟠 Download .blend</a>
   </div>
   <div class="status" id="status3d"></div>
 
@@ -190,7 +192,10 @@ generate3dBtn.addEventListener('click', async () => {
     imageToSend = await new Promise(r => { reader.onload = () => r(reader.result.split(',')[1]); reader.readAsDataURL(blob); });
   }
   generate3dBtn.disabled = true;
-  status3d.textContent = 'Sending to Rodin Sketch... this takes 20–60 seconds. Please wait.';
+  document.getElementById('downloadFbxBtn').style.display = 'none';
+  document.getElementById('downloadBlendBtn').style.display = 'none';
+  downloadBtn.style.display = 'none';
+  status3d.textContent = 'Starting pipeline: Rodin → Scale → Rig → FBX...';
   status3d.className = 'status';
 
   try {
@@ -211,9 +216,14 @@ generate3dBtn.addEventListener('click', async () => {
       // Poll for completion
       const jobId = data.job_id;
       const statusLabels = {
-        queued: 'Queued...', submitting: 'Submitting to Rodin...',
-        generating: 'Generating 3D model...', downloading: 'Downloading result...',
-        done: 'Done!', error: 'Error'
+        queued: '⏳ Queued...',
+        submitting: '📤 Submitting to Rodin...',
+        generating: '🪩 Generating 3D mesh (20–60s)...',
+        downloading: '⬇️ Downloading mesh from Rodin...',
+        scaling: '📏 Scaling mesh to match image...',
+        rigging: '🦴 Transferring skeleton & skin weights...',
+        saving_blend: '🟠 Saving comparison .blend...',
+        done: '✅ Done!', error: '❌ Error'
       };
       while (true) {
         await new Promise(r => setTimeout(r, 3000));
@@ -221,17 +231,34 @@ generate3dBtn.addEventListener('click', async () => {
         const job = await pollResp.json();
         status3d.textContent = statusLabels[job.status] || job.status;
         if (job.status === 'done') {
-          status3d.textContent = '\u2705 3D model generated!';
+          status3d.textContent = '✅ Rigged avatar ready!';
           status3d.className = 'status success';
-          downloadBtn.href = job.result.glb_url;
-          downloadBtn.download = job.result.filename;
-          downloadBtn.style.display = '';
-          viewerPanel.style.display = '';
-          loadGLBViewer(job.result.glb_url);
+          // GLB preview
+          if (job.result.glb_url) {
+            downloadBtn.href = job.result.glb_url;
+            downloadBtn.download = job.result.glb_filename;
+            downloadBtn.style.display = '';
+            viewerPanel.style.display = '';
+            loadGLBViewer(job.result.glb_url);
+          }
+          // FBX download
+          if (job.result.fbx_url) {
+            const fbxBtn = document.getElementById('downloadFbxBtn');
+            fbxBtn.href = job.result.fbx_url;
+            fbxBtn.download = job.result.fbx_filename;
+            fbxBtn.style.display = '';
+          }
+          // .blend download
+          if (job.result.blend_url) {
+            const blendBtn = document.getElementById('downloadBlendBtn');
+            blendBtn.href = job.result.blend_url;
+            blendBtn.download = job.result.blend_filename;
+            blendBtn.style.display = '';
+          }
           loadOutputFiles();
           break;
         } else if (job.status === 'error') {
-          status3d.textContent = 'Error: ' + (job.error || 'Unknown');
+          status3d.textContent = '❌ Error: ' + (job.error || 'Unknown');
           status3d.className = 'status error';
           break;
         }

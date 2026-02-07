@@ -99,10 +99,16 @@ def _rodin_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
     return body, f"multipart/form-data; boundary={boundary}"
 
 
-def generate_3d_rodin(image_bytes: bytes, job_id: str):
-    """Run Rodin Sketch (Gen-1) in background thread. Updates jobs[job_id]."""
+def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = None):
+    """Full pipeline in background thread: Rodin → Scale → Rig Transfer → .blend
+    Updates jobs[job_id] with status throughout."""
     try:
-        # 1. Submit task
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        # =====================================================================
+        # Phase 1: Rodin 3D Generation
+        # =====================================================================
         print(f"[Job {job_id}] Submitting to Rodin Sketch...")
         jobs[job_id]["status"] = "submitting"
 
@@ -125,7 +131,6 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str):
         subscription_key = result["jobs"]["subscription_key"]
         print(f"[Job {job_id}] Task UUID: {task_uuid}")
 
-        # 2. Poll status
         jobs[job_id]["status"] = "generating"
         start = time.time()
         while time.time() - start < 300:
@@ -151,8 +156,7 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str):
         else:
             raise Exception("Rodin timed out after 300s")
 
-        # 3. Download
-        print(f"[Job {job_id}] Downloading results...")
+        print(f"[Job {job_id}] Downloading Rodin results...")
         jobs[job_id]["status"] = "downloading"
         req = urllib.request.Request(
             f"{RODIN_BASE_URL}/download",
@@ -163,22 +167,80 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str):
         with urllib.request.urlopen(req, timeout=30) as resp:
             dl_result = json.loads(resp.read())
 
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        glb_dest = None
+        raw_glb = None
         for item in dl_result.get("list", []):
             name = item["name"]
-            dest = MODELS_DIR / f"rodin_{job_id}_{name}"
+            dest = MODELS_DIR / f"job{job_id}_raw_{name}"
             urllib.request.urlretrieve(item["url"], str(dest))
             print(f"  Downloaded: {dest}")
             if name.endswith(".glb"):
-                glb_dest = dest
+                raw_glb = dest
 
-        if not glb_dest:
+        if not raw_glb:
             raise Exception("No GLB file in Rodin output")
 
-        print(f"[Job {job_id}] Done! {glb_dest}")
+        print(f"[Job {job_id}] Raw mesh: {raw_glb}")
+
+        # =====================================================================
+        # Phase 2: Scale (if we have source image with alpha)
+        # =====================================================================
+        scaled_glb = MODELS_DIR / f"job{job_id}_scaled.glb"
+        if source_image_path and Path(source_image_path).exists():
+            print(f"[Job {job_id}] Scaling mesh...")
+            jobs[job_id]["status"] = "scaling"
+            ok, msg = run_blender_script("step3_scale.py",
+                [str(raw_glb), str(scaled_glb), source_image_path],
+                label=f"Job {job_id} Scale")
+            if not ok:
+                print(f"[Job {job_id}] Scale failed, using raw mesh: {msg}")
+                scaled_glb = raw_glb
+        else:
+            print(f"[Job {job_id}] No source image for scaling, using raw mesh")
+            scaled_glb = raw_glb
+
+        # =====================================================================
+        # Phase 3: Rig Transfer
+        # =====================================================================
+        rig_path = TEMPLATES_DIR / "rig.fbx"
+        rigged_fbx = OUTPUT_DIR / f"job{job_id}_rigged.fbx"
+
+        print(f"[Job {job_id}] Transferring rig...")
+        jobs[job_id]["status"] = "rigging"
+        ok, msg = run_blender_script("step5_rig_transfer.py",
+            [str(scaled_glb), str(rig_path), str(rigged_fbx)],
+            label=f"Job {job_id} Rig")
+        if not ok:
+            raise Exception(f"Rig transfer failed: {msg}")
+
+        # =====================================================================
+        # Phase 4: Comparison .blend
+        # =====================================================================
+        comparison_blend = OUTPUT_DIR / f"job{job_id}_comparison.blend"
+
+        print(f"[Job {job_id}] Saving comparison .blend...")
+        jobs[job_id]["status"] = "saving_blend"
+        ok, msg = run_blender_script("save_comparison_blend.py",
+            [str(rigged_fbx), str(rig_path), str(comparison_blend)],
+            label=f"Job {job_id} Blend")
+        if not ok:
+            print(f"[Job {job_id}] Comparison blend failed (non-fatal): {msg}")
+            comparison_blend = None
+
+        # =====================================================================
+        # Done!
+        # =====================================================================
+        print(f"[Job {job_id}] Pipeline complete!")
         jobs[job_id]["status"] = "done"
-        jobs[job_id]["result"] = {"glb_url": f"/models/{glb_dest.name}", "filename": glb_dest.name}
+        result_data = {
+            "glb_url": f"/models/{raw_glb.name}",
+            "glb_filename": raw_glb.name,
+            "fbx_url": f"/output/{rigged_fbx.name}",
+            "fbx_filename": rigged_fbx.name,
+        }
+        if comparison_blend and comparison_blend.exists():
+            result_data["blend_url"] = f"/output/{comparison_blend.name}"
+            result_data["blend_filename"] = comparison_blend.name
+        jobs[job_id]["result"] = result_data
 
     except Exception as e:
         import traceback
@@ -188,21 +250,20 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str):
         jobs[job_id]["error"] = str(e)
 
 
-def generate_comparison_blend(mesh_path: str, rig_path: str, output_path: str) -> tuple[bool, str]:
-    """Run Blender to create a comparison .blend file."""
+def run_blender_script(script_name: str, args: list[str], label: str = "") -> tuple[bool, str]:
+    """Run a Blender script. Returns (success, stdout_or_error)."""
     import subprocess
-    script = str(SCRIPTS_DIR / "save_comparison_blend.py")
-    cmd = [
-        "blender", "--background", "--python", script,
-        "--", mesh_path, rig_path, output_path
-    ]
-    print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    script = str(SCRIPTS_DIR / script_name)
+    cmd = ["blender", "--background", "--python", script, "--"] + args
+    print(f"[{label}] Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    print(result.stdout[-1000:] if result.stdout else "")
     if result.returncode != 0:
-        print(f"Blender stderr: {result.stderr}")
-        return False, result.stderr[-500:] if result.stderr else "Blender failed"
-    print(f"Blend saved: {output_path}")
-    return True, output_path
+        err = result.stderr[-500:] if result.stderr else "Blender failed"
+        print(f"[{label}] FAILED: {err}")
+        return False, err
+    print(f"[{label}] Done")
+    return True, result.stdout
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -311,7 +372,7 @@ class Handler(SimpleHTTPRequestHandler):
             self._json_response({"success": False, "error": result})
 
     def _handle_generate3d(self):
-        """Start async 3D generation, return job_id for polling."""
+        """Start async full pipeline: Rodin → Scale → Rig → .blend. Returns job_id for polling."""
         global job_counter
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
@@ -328,8 +389,18 @@ class Handler(SimpleHTTPRequestHandler):
             job_counter += 1
             job_id = str(job_counter)
 
+        # Save processed image for the scale step (needs alpha bbox)
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        source_image_path = str(MODELS_DIR / f"job{job_id}_source.png")
+        with open(source_image_path, "wb") as f:
+            f.write(image_bytes)
+
         jobs[job_id] = {"status": "queued"}
-        thread = threading.Thread(target=generate_3d_rodin, args=(image_bytes, job_id), daemon=True)
+        thread = threading.Thread(
+            target=generate_3d_rodin,
+            args=(image_bytes, job_id, source_image_path),
+            daemon=True
+        )
         thread.start()
 
         self._json_response({"success": True, "job_id": job_id})
