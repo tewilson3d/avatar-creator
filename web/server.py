@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Web server for Avatar Pipeline - Gemini image processing UI."""
+"""Web server for Avatar Pipeline - Gemini image processing + Trellis 2 3D generation."""
 import os
 import sys
 import json
 import base64
+import time
+import threading
 import urllib.request
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
@@ -11,6 +13,9 @@ from pathlib import Path
 PORT = 8000
 WEB_DIR = Path(__file__).parent
 MODELS_DIR = Path(__file__).parent.parent / "models"
+OUTPUT_DIR = Path(__file__).parent.parent / "output"
+TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = "gemini-3-pro-image-preview"
 
@@ -21,6 +26,11 @@ PROMPT = (
     "The output should be the full character cleanly isolated on a pure white (#FFFFFF) background, "
     "suitable as input for an AI 3D model generator."
 )
+
+# Async job tracking
+jobs = {}  # job_id -> {"status": "running"|"done"|"error", "result": ..., "error": ...}
+job_counter = 0
+job_lock = threading.Lock()
 
 
 def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[bool, str]:
@@ -33,25 +43,15 @@ def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[b
         f"models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
     payload = {
-        "contents": [{
-            "parts": [
-                {"inlineData": {"mimeType": mime_type, "data": image_b64}},
-                {"text": text},
-            ]
-        }],
-        "generationConfig": {
-            "responseModalities": ["IMAGE", "TEXT"],
-            "temperature": 0.2,
-        },
+        "contents": [{"parts": [
+            {"inlineData": {"mimeType": mime_type, "data": image_b64}},
+            {"text": text},
+        ]}],
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"], "temperature": 0.2},
     }
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
             result = json.loads(resp.read())
@@ -61,101 +61,92 @@ def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[b
     except Exception as e:
         return False, str(e)
 
-    # Extract image
     for candidate in result.get("candidates", []):
         for part in candidate.get("content", {}).get("parts", []):
             if "inlineData" in part:
                 return True, part["inlineData"]["data"]
-
     return False, "Gemini returned no image"
 
 
-def generate_3d_trellis(image_bytes: bytes) -> tuple[bool, str]:
-    """Send image to Trellis 2 HF Space, return (success, glb_path_or_error)."""
+def generate_3d_trellis(image_bytes: bytes, job_id: str):
+    """Run Trellis 2 in background thread. Updates jobs[job_id]."""
     try:
         from gradio_client import Client, handle_file
-    except ImportError:
-        return False, "gradio_client not installed"
+        import tempfile
+        import shutil
 
-    import tempfile
-    import shutil
+        tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp_img.write(image_bytes)
+        tmp_img.close()
 
-    # Write image to temp file
-    tmp_img = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-    tmp_img.write(image_bytes)
-    tmp_img.close()
+        try:
+            print(f"[Job {job_id}] Connecting to Trellis 2...")
+            jobs[job_id]["status"] = "connecting"
+            client = Client("microsoft/TRELLIS.2")
 
-    try:
-        print("Connecting to Trellis 2 HF Space...")
-        client = Client("microsoft/TRELLIS.2")
+            print(f"[Job {job_id}] Starting session...")
+            jobs[job_id]["status"] = "starting"
+            client.predict(api_name="/start_session")
 
-        # Start session
-        print("Starting session...")
-        client.predict(api_name="/start_session")
+            print(f"[Job {job_id}] Preprocessing image...")
+            jobs[job_id]["status"] = "preprocessing"
+            processed = client.predict(input=handle_file(tmp_img.name), api_name="/preprocess_image")
 
-        # Preprocess image
-        print("Preprocessing image...")
-        processed = client.predict(
-            input=handle_file(tmp_img.name),
-            api_name="/preprocess_image"
-        )
+            seed = client.predict(randomize_seed=True, seed=0, api_name="/get_seed")
+            print(f"[Job {job_id}] Seed: {seed}")
 
-        # Get seed
-        seed = client.predict(
-            randomize_seed=True,
-            seed=0,
-            api_name="/get_seed"
-        )
-        print(f"Seed: {seed}")
+            print(f"[Job {job_id}] Generating 3D model...")
+            jobs[job_id]["status"] = "generating"
+            client.predict(
+                image=processed, seed=seed, resolution="512",
+                ss_guidance_strength=7.5, ss_guidance_rescale=0.7,
+                ss_sampling_steps=12, ss_rescale_t=5.0,
+                shape_slat_guidance_strength=7.5, shape_slat_guidance_rescale=0.5,
+                shape_slat_sampling_steps=12, shape_slat_rescale_t=3.0,
+                tex_slat_guidance_strength=1.0, tex_slat_guidance_rescale=0.0,
+                tex_slat_sampling_steps=12, tex_slat_rescale_t=3.0,
+                api_name="/image_to_3d"
+            )
 
-        # Generate 3D
-        print("Generating 3D model (this takes 30-120s)...")
-        preview = client.predict(
-            image=processed,
-            seed=seed,
-            resolution="512",
-            ss_guidance_strength=7.5,
-            ss_guidance_rescale=0.7,
-            ss_sampling_steps=12,
-            ss_rescale_t=5.0,
-            shape_slat_guidance_strength=7.5,
-            shape_slat_guidance_rescale=0.5,
-            shape_slat_sampling_steps=12,
-            shape_slat_rescale_t=3.0,
-            tex_slat_guidance_strength=1.0,
-            tex_slat_guidance_rescale=0.0,
-            tex_slat_sampling_steps=12,
-            tex_slat_rescale_t=3.0,
-            api_name="/image_to_3d"
-        )
-        print(f"3D generation done. Extracting GLB...")
+            print(f"[Job {job_id}] Extracting GLB...")
+            jobs[job_id]["status"] = "extracting"
+            result = client.predict(decimation_target=300000, texture_size=2048, api_name="/extract_glb")
 
-        # Extract GLB
-        result = client.predict(
-            decimation_target=300000,
-            texture_size=2048,
-            api_name="/extract_glb"
-        )
-        print(f"Extract result: {result}")
+            glb_source = result[0] if isinstance(result, (list, tuple)) else result
+            MODELS_DIR.mkdir(parents=True, exist_ok=True)
+            glb_dest = MODELS_DIR / f"trellis_{job_id}.glb"
+            shutil.copy2(glb_source, glb_dest)
 
-        # result is (glb_path, download_path)
-        glb_source = result[0] if isinstance(result, (list, tuple)) else result
+            print(f"[Job {job_id}] Done! {glb_dest}")
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["result"] = {"glb_url": f"/models/{glb_dest.name}", "filename": glb_dest.name}
 
-        # Copy to our models dir
-        MODELS_DIR.mkdir(parents=True, exist_ok=True)
-        import time
-        glb_dest = MODELS_DIR / f"trellis_{int(time.time())}.glb"
-        shutil.copy2(glb_source, glb_dest)
-        print(f"GLB saved: {glb_dest}")
-
-        return True, str(glb_dest)
+        finally:
+            os.unlink(tmp_img.name)
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return False, str(e)
-    finally:
-        os.unlink(tmp_img.name)
+        print(f"[Job {job_id}] ERROR: {e}")
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["error"] = str(e)
+
+
+def generate_comparison_blend(mesh_path: str, rig_path: str, output_path: str) -> tuple[bool, str]:
+    """Run Blender to create a comparison .blend file."""
+    import subprocess
+    script = str(SCRIPTS_DIR / "save_comparison_blend.py")
+    cmd = [
+        "blender", "--background", "--python", script,
+        "--", mesh_path, rig_path, output_path
+    ]
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        print(f"Blender stderr: {result.stderr}")
+        return False, result.stderr[-500:] if result.stderr else "Blender failed"
+    print(f"Blend saved: {output_path}")
+    return True, output_path
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -163,7 +154,6 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
     def do_GET(self):
-        # Serve GLB files from models dir
         if self.path.startswith("/models/"):
             filename = self.path.split("/models/")[-1]
             filepath = MODELS_DIR / filename
@@ -173,24 +163,55 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "model/gltf-binary")
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(data)
                 return
+        if self.path.startswith("/output/"):
+            filename = self.path.split("/output/")[-1]
+            filepath = OUTPUT_DIR / filename
+            if filepath.exists():
+                content_types = {
+                    '.fbx': 'application/octet-stream',
+                    '.blend': 'application/x-blender',
+                    '.glb': 'model/gltf-binary',
+                }
+                ct = content_types.get(filepath.suffix, 'application/octet-stream')
+                with open(filepath, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'attachment; filename="{filepath.name}"')
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_error(404, f"File not found: {filename}")
+            return
+        if self.path == "/api/outputs":
+            return self._handle_list_outputs()
+        if self.path.startswith("/api/job/"):
+            job_id = self.path.split("/api/job/")[-1]
+            if job_id in jobs:
+                self._json_response(jobs[job_id])
+            else:
+                self._json_response({"status": "not_found"}, 404)
+            return
         return super().do_GET()
 
     def do_POST(self):
         if self.path == "/api/generate3d":
             return self._handle_generate3d()
-        if self.path != "/api/process":
-            self.send_error(404)
-            return
+        if self.path == "/api/process":
+            return self._handle_process()
+        if self.path == "/api/generate-blend":
+            return self._handle_generate_blend()
+        self.send_error(404)
 
+    def _handle_process(self):
         content_type = self.headers.get("Content-Type", "")
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
 
-        # Parse multipart form data
         boundary = content_type.split("boundary=")[-1].encode()
         parts = body.split(b"--" + boundary)
 
@@ -199,25 +220,20 @@ class Handler(SimpleHTTPRequestHandler):
         prompt = ""
 
         for part in parts:
-            if b"name=\"image\"" in part:
-                # Find content type
+            if b'name="image"' in part:
                 if b"Content-Type: " in part:
                     ct_line = part.split(b"Content-Type: ")[1].split(b"\r\n")[0]
                     mime_type = ct_line.decode().strip()
-                # Extract binary data (after double CRLF)
                 data_start = part.find(b"\r\n\r\n")
                 if data_start != -1:
                     image_bytes = part[data_start + 4:].rstrip(b"\r\n--")
-                    if image_bytes.endswith(b"--"):
-                        image_bytes = image_bytes[:-2]
-                    if image_bytes.endswith(b"\r\n"):
-                        image_bytes = image_bytes[:-2]
-            elif b"name=\"prompt\"" in part:
+                    if image_bytes.endswith(b"--"): image_bytes = image_bytes[:-2]
+                    if image_bytes.endswith(b"\r\n"): image_bytes = image_bytes[:-2]
+            elif b'name="prompt"' in part:
                 data_start = part.find(b"\r\n\r\n")
                 if data_start != -1:
                     prompt = part[data_start + 4:].rstrip(b"\r\n--").decode("utf-8", errors="replace").strip()
-                    if prompt.endswith("--"):
-                        prompt = prompt[:-2].strip()
+                    if prompt.endswith("--"): prompt = prompt[:-2].strip()
 
         if not image_bytes:
             self._json_response({"success": False, "error": "No image in request"})
@@ -233,7 +249,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._json_response({"success": False, "error": result})
 
     def _handle_generate3d(self):
-        """Accept base64 PNG image, send to Trellis 2, return GLB path."""
+        """Start async 3D generation, return job_id for polling."""
+        global job_counter
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         data = json.loads(body)
@@ -244,12 +261,74 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         image_bytes = base64.b64decode(image_b64)
-        print(f"Generate 3D: {len(image_bytes)} bytes")
 
-        success, result = generate_3d_trellis(image_bytes)
+        with job_lock:
+            job_counter += 1
+            job_id = str(job_counter)
+
+        jobs[job_id] = {"status": "queued"}
+        thread = threading.Thread(target=generate_3d_trellis, args=(image_bytes, job_id), daemon=True)
+        thread.start()
+
+        self._json_response({"success": True, "job_id": job_id})
+
+    def _handle_list_outputs(self):
+        """List available output files."""
+        files = []
+        if OUTPUT_DIR.exists():
+            for f in sorted(OUTPUT_DIR.iterdir()):
+                if f.suffix in ('.fbx', '.blend', '.glb') and f.is_file():
+                    files.append({
+                        "name": f.name,
+                        "url": f"/output/{f.name}",
+                        "size": f.stat().st_size,
+                        "type": f.suffix[1:],
+                    })
+        self._json_response({"files": files})
+
+    def _handle_generate_blend(self):
+        """Generate a comparison .blend with the output mesh + base rig."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body) if body else {}
+
+        # Find the mesh to use — either specified or the latest rigged FBX
+        mesh_name = data.get("mesh")
+        if mesh_name:
+            mesh_path = OUTPUT_DIR / mesh_name
+        else:
+            # Find latest rigged FBX in output
+            fbx_files = sorted(OUTPUT_DIR.glob("*_rigged.fbx"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not fbx_files:
+                # Fallback: any GLB in models
+                glb_files = sorted(MODELS_DIR.glob("*.glb"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if glb_files:
+                    mesh_path = glb_files[0]
+                else:
+                    self._json_response({"success": False, "error": "No output mesh found"})
+                    return
+            else:
+                mesh_path = fbx_files[0]
+
+        rig_path = TEMPLATES_DIR / "rig.fbx"
+        if not rig_path.exists():
+            self._json_response({"success": False, "error": "Base rig.fbx not found"})
+            return
+
+        if not mesh_path.exists():
+            self._json_response({"success": False, "error": f"Mesh not found: {mesh_path.name}"})
+            return
+
+        blend_name = mesh_path.stem + "_comparison.blend"
+        blend_path = OUTPUT_DIR / blend_name
+
+        success, result = generate_comparison_blend(str(mesh_path), str(rig_path), str(blend_path))
         if success:
-            filename = Path(result).name
-            self._json_response({"success": True, "glb_url": f"/models/{filename}", "filename": filename})
+            self._json_response({
+                "success": True,
+                "url": f"/output/{blend_name}",
+                "filename": blend_name,
+            })
         else:
             self._json_response({"success": False, "error": result})
 
@@ -262,17 +341,16 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        print(f"[{self.log_date_time_string()}] {format % args}")
+        print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
 
 def main():
     if not GEMINI_API_KEY:
         print("ERROR: GEMINI_API_KEY not set")
         sys.exit(1)
-
     server = HTTPServer(("", PORT), Handler)
-    print(f"Server running on http://localhost:{PORT}")
-    print(f"Gemini model: {MODEL}")
+    print(f"Server running on http://localhost:{PORT}", flush=True)
+    print(f"Gemini model: {MODEL}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
