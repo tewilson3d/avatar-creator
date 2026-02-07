@@ -67,10 +67,10 @@ def main():
         str(processed_image), str(raw_model)
     ])
 
-    # Step 3: Blender scale
+    # Step 3: Blender scale (uses alpha bbox from source image)
     run_step("Scale Model", [
         "blender", "--background", "--python", str(SCRIPTS / "step3_scale.py"),
-        "--", str(raw_model), str(scaled_model)
+        "--", str(raw_model), str(scaled_model), str(processed_image)
     ])
 
     # Step 4: Retopology via QuadRemesher VM
