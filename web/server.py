@@ -12,7 +12,22 @@ from pathlib import Path
 
 PORT = 8000
 WEB_DIR = Path(__file__).parent
-MODELS_DIR = Path(__file__).parent.parent / "models"
+BASE_DIR = Path(__file__).parent.parent
+MODELS_DIR = BASE_DIR / "models"
+ENV_FILE = BASE_DIR / ".env"
+
+
+def load_env():
+    """Load key=value pairs from .env file into os.environ."""
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, v = line.split('=', 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+load_env()
 OUTPUT_DIR = Path(__file__).parent.parent / "output"
 TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
 SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
@@ -189,6 +204,10 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/outputs":
             return self._handle_list_outputs()
+        if self.path == "/api/admin/config":
+            return self._handle_get_config()
+        if self.path == "/admin":
+            return self._serve_admin()
         if self.path.startswith("/api/job/"):
             job_id = self.path.split("/api/job/")[-1]
             if job_id in jobs:
@@ -205,6 +224,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_process()
         if self.path == "/api/generate-blend":
             return self._handle_generate_blend()
+        if self.path == "/api/admin/config":
+            return self._handle_save_config()
         self.send_error(404)
 
     def _handle_process(self):
@@ -331,6 +352,53 @@ class Handler(SimpleHTTPRequestHandler):
             })
         else:
             self._json_response({"success": False, "error": result})
+
+    def _handle_get_config(self):
+        """Return current config (keys masked)."""
+        config = {}
+        if ENV_FILE.exists():
+            for line in ENV_FILE.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    config[k.strip()] = v.strip()
+        # Return with masked values for display, full values for editing
+        items = []
+        for k, v in config.items():
+            masked = v[:8] + '...' + v[-4:] if len(v) > 16 else '****'
+            items.append({"key": k, "value": v, "masked": masked})
+        self._json_response({"config": items})
+
+    def _handle_save_config(self):
+        """Save config to .env file."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        entries = data.get("config", {})
+        lines = []
+        for k, v in entries.items():
+            lines.append(f"{k}={v}")
+        ENV_FILE.write_text('\n'.join(lines) + '\n')
+        # Reload into environment
+        for k, v in entries.items():
+            os.environ[k] = v
+        # Update the global API key
+        global GEMINI_API_KEY
+        GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+        self._json_response({"success": True})
+
+    def _serve_admin(self):
+        """Serve the admin page."""
+        admin_path = WEB_DIR / "admin.html"
+        if admin_path.exists():
+            data = admin_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self.send_error(404)
 
     def _json_response(self, data, status=200):
         body = json.dumps(data).encode()
