@@ -405,6 +405,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_save_prompt_prefix()
         if self.path == "/api/admin/settings":
             return self._handle_save_settings()
+        if self.path == "/api/admin/cleanup":
+            return self._handle_cleanup()
         self.send_error(404)
 
     def _handle_process(self):
@@ -600,6 +602,27 @@ class Handler(SimpleHTTPRequestHandler):
             self._update_env_key("SHOW_BASE_IMAGE", str(SHOW_BASE_IMAGE).lower())
             print(f"Updated SHOW_BASE_IMAGE: {SHOW_BASE_IMAGE}")
         self._json_response({"success": True})
+
+    def _handle_cleanup(self):
+        """Delete all processed files from models/ and output/ directories."""
+        deleted = []
+        kept_extensions = {'.gitkeep'}
+        for directory in [MODELS_DIR, OUTPUT_DIR]:
+            if not directory.exists():
+                continue
+            for f in directory.iterdir():
+                if f.is_file() and f.suffix not in kept_extensions:
+                    try:
+                        f.unlink()
+                        deleted.append(str(f.relative_to(BASE_DIR)))
+                    except Exception as e:
+                        print(f"Failed to delete {f}: {e}")
+        # Reset job tracking
+        global jobs, job_counter
+        jobs = {}
+        job_counter = 0
+        print(f"Cleanup: deleted {len(deleted)} files")
+        self._json_response({"success": True, "deleted": len(deleted), "files": deleted})
 
     def _update_env_key(self, key, value):
         """Update a single key in the .env file."""

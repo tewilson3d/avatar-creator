@@ -77,6 +77,14 @@
   </div>
 
   <div class="section">
+    <div class="section-title">Cleanup</div>
+    <p style="font-size:13px;color:#888;margin-bottom:16px">Delete all processed files from <code style="color:#4f9eff">models/</code> and <code style="color:#4f9eff">output/</code> directories. This cannot be undone.</p>
+    <div id="cleanupInfo" style="font-size:13px;color:#666;margin-bottom:12px">Loading file count...</div>
+    <button class="btn btn-danger" id="cleanupBtn" onclick="cleanupFiles()">🗑 Delete All Processed Files</button>
+    <div class="status" id="cleanupStatus"></div>
+  </div>
+
+  <div class="section">
     <div class="section-title">Gemini Prompt Prefix</div>
     <p style="font-size:13px;color:#888;margin-bottom:12px">This text is always prepended to the user's input before sending to Gemini. The final prompt will be: <strong style="color:#4f9eff">prefix + user input</strong></p>
     <textarea class="prefix-textarea" id="prefixField" placeholder="Loading..."></textarea>
@@ -196,6 +204,50 @@ async function saveShowBaseImage() {
 }
 
 loadSettings();
+
+// === Cleanup ===
+async function loadFileCount() {
+  try {
+    const resp = await fetch('/api/outputs');
+    const data = await resp.json();
+    const count = (data.files || []).length;
+    document.getElementById('cleanupInfo').textContent = count > 0
+      ? `${count} output file(s) currently on disk`
+      : 'No output files on disk';
+  } catch(e) {}
+}
+
+async function cleanupFiles() {
+  if (!confirm('Delete ALL processed files from models/ and output/? This cannot be undone.')) return;
+  const btn = document.getElementById('cleanupBtn');
+  const status = document.getElementById('cleanupStatus');
+  btn.disabled = true;
+  status.textContent = 'Deleting...';
+  status.className = 'status';
+  try {
+    const resp = await fetch('/api/admin/cleanup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    });
+    const data = await resp.json();
+    if (data.success) {
+      status.textContent = `\u2713 Deleted ${data.deleted} file(s)`;
+      status.className = 'status success';
+      loadFileCount();
+    } else {
+      status.textContent = 'Error: ' + (data.error || 'Unknown');
+      status.className = 'status error';
+    }
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+    status.className = 'status error';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+loadFileCount();
 
 async function loadConfig() {
   try {
