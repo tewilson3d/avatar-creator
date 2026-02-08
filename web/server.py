@@ -338,6 +338,19 @@ class Handler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(data)
                 return
+        if self.path == "/scripts/combined_scale_retopo_rig.py":
+            script_path = SCRIPTS_DIR / "combined_scale_retopo_rig.py"
+            if script_path.exists():
+                data = script_path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/x-python")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", 'attachment; filename="combined_scale_retopo_rig.py"')
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            self.send_error(404)
+            return
         if self.path.startswith("/output/"):
             filename = self.path.split("/output/")[-1]
             filepath = OUTPUT_DIR / filename
