@@ -248,20 +248,10 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             scaled_glb = raw_glb
 
         # =====================================================================
-        # Phase 3: Retopology (Blender QuadriFlow)
+        # Phase 3: Retopology (TEMPORARILY DISABLED)
         # =====================================================================
-        retopo_glb = MODELS_DIR / f"job{job_id}_retopo.glb"
-
-        print(f"[Job {job_id}] Retopologizing mesh (QuadriFlow)...")
-        jobs[job_id]["status"] = "retopology"
-        ok, msg = run_blender_script("step4_retopo.py",
-            [str(scaled_glb), str(retopo_glb), "--faces", "5000"],
-            label=f"Job {job_id} Retopo")
-        if not ok or not retopo_glb.exists():
-            print(f"[Job {job_id}] Retopo failed, using scaled mesh")
-            retopo_glb = scaled_glb
-        else:
-            print(f"[Job {job_id}] Retopo done: {retopo_glb}")
+        retopo_glb = scaled_glb
+        print(f"[Job {job_id}] Retopology SKIPPED (temporarily disabled)")
 
         # =====================================================================
         # Phase 4: Rig Transfer
