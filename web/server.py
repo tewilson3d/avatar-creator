@@ -40,6 +40,7 @@ DEFAULT_GEMINI_PROMPT_PREFIX = (
     "keep the exact same style, proportions and pose, please change the character to look the following, but do not add a face:"
 )
 GEMINI_PROMPT_PREFIX = os.environ.get("GEMINI_PROMPT_PREFIX", DEFAULT_GEMINI_PROMPT_PREFIX)
+SHOW_BASE_IMAGE = os.environ.get("SHOW_BASE_IMAGE", "true").lower() == "true"
 
 # Async job tracking
 jobs = {}  # job_id -> {"status": "running"|"done"|"error", "result": ..., "error": ...}
@@ -378,6 +379,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_get_config()
         if self.path == "/api/admin/prompt-prefix":
             return self._handle_get_prompt_prefix()
+        if self.path == "/api/admin/settings":
+            return self._handle_get_settings()
         if self.path == "/admin":
             return self._serve_admin()
         if self.path.startswith("/api/job/"):
@@ -400,6 +403,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_save_config()
         if self.path == "/api/admin/prompt-prefix":
             return self._handle_save_prompt_prefix()
+        if self.path == "/api/admin/settings":
+            return self._handle_save_settings()
         self.send_error(404)
 
     def _handle_process(self):
@@ -554,8 +559,8 @@ class Handler(SimpleHTTPRequestHandler):
         # Return with masked values for display, full values for editing
         items = []
         for k, v in config.items():
-            if k == "GEMINI_PROMPT_PREFIX":
-                continue  # Managed via dedicated prompt-prefix endpoint
+            if k in ("GEMINI_PROMPT_PREFIX", "SHOW_BASE_IMAGE"):
+                continue  # Managed via dedicated UI sections
             masked = v[:8] + '...' + v[-4:] if len(v) > 16 else '****'
             items.append({"key": k, "value": v, "masked": masked})
         self._json_response({"config": items})
@@ -579,6 +584,39 @@ class Handler(SimpleHTTPRequestHandler):
         RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
         self._json_response({"success": True})
 
+    def _handle_get_settings(self):
+        """Return UI settings."""
+        self._json_response({"show_base_image": SHOW_BASE_IMAGE})
+
+    def _handle_save_settings(self):
+        """Save UI settings."""
+        global SHOW_BASE_IMAGE
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        if "show_base_image" in data:
+            SHOW_BASE_IMAGE = bool(data["show_base_image"])
+            os.environ["SHOW_BASE_IMAGE"] = str(SHOW_BASE_IMAGE).lower()
+            self._update_env_key("SHOW_BASE_IMAGE", str(SHOW_BASE_IMAGE).lower())
+            print(f"Updated SHOW_BASE_IMAGE: {SHOW_BASE_IMAGE}")
+        self._json_response({"success": True})
+
+    def _update_env_key(self, key, value):
+        """Update a single key in the .env file."""
+        if ENV_FILE.exists():
+            lines = ENV_FILE.read_text().splitlines()
+            found = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith(f"{key}="):
+                    lines[i] = f"{key}={value}"
+                    found = True
+                    break
+            if not found:
+                lines.append(f"{key}={value}")
+            ENV_FILE.write_text('\n'.join(lines) + '\n')
+        else:
+            ENV_FILE.write_text(f"{key}={value}\n")
+
     def _handle_get_prompt_prefix(self):
         """Return current Gemini prompt prefix."""
         self._json_response({"prefix": GEMINI_PROMPT_PREFIX})
@@ -595,20 +633,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         GEMINI_PROMPT_PREFIX = new_prefix
         os.environ["GEMINI_PROMPT_PREFIX"] = new_prefix
-        # Update .env file
-        if ENV_FILE.exists():
-            lines = ENV_FILE.read_text().splitlines()
-            found = False
-            for i, line in enumerate(lines):
-                if line.strip().startswith("GEMINI_PROMPT_PREFIX="):
-                    lines[i] = f"GEMINI_PROMPT_PREFIX={new_prefix}"
-                    found = True
-                    break
-            if not found:
-                lines.append(f"GEMINI_PROMPT_PREFIX={new_prefix}")
-            ENV_FILE.write_text('\n'.join(lines) + '\n')
-        else:
-            ENV_FILE.write_text(f"GEMINI_PROMPT_PREFIX={new_prefix}\n")
+        self._update_env_key("GEMINI_PROMPT_PREFIX", new_prefix)
         print(f"Updated GEMINI_PROMPT_PREFIX: {new_prefix[:80]}...")
         self._json_response({"success": True})
 

@@ -63,7 +63,14 @@
 </div>
 <div class="container">
   <!-- Step 1: Gemini Processing -->
-  <div id="outputPanel" style="max-width:400px;margin:0 auto">
+  <div id="baseImagePanel" style="max-width:400px;margin:0 auto;display:none">
+    <div class="panel-title" style="text-align:center">Base Character</div>
+    <div class="image-box" style="min-height:200px">
+      <img id="baseImg" src="/base_character.png">
+    </div>
+  </div>
+  <div id="outputPanel" style="max-width:400px;margin:0 auto;display:none">
+    <div class="panel-title" style="text-align:center">Gemini Output</div>
     <div class="image-box" style="min-height:200px">
       <img id="outputImg">
     </div>
@@ -123,13 +130,20 @@ const outputImg = document.getElementById('outputImg');
 const statusEl = document.getElementById('status');
 let processedImageB64 = null;
 
-// Load and display prompt prefix
+// Load settings and prompt prefix
 (async () => {
   try {
-    const resp = await fetch('/api/admin/prompt-prefix');
-    const data = await resp.json();
-    if (data.prefix) {
-      document.getElementById('prefixDisplay').textContent = 'Prefix: "' + data.prefix + '"';
+    const [prefixResp, settingsResp] = await Promise.all([
+      fetch('/api/admin/prompt-prefix'),
+      fetch('/api/admin/settings')
+    ]);
+    const prefixData = await prefixResp.json();
+    if (prefixData.prefix) {
+      document.getElementById('prefixDisplay').textContent = 'Prefix: "' + prefixData.prefix + '"';
+    }
+    const settings = await settingsResp.json();
+    if (settings.show_base_image) {
+      document.getElementById('baseImagePanel').style.display = '';
     }
   } catch(e) {}
 })();
@@ -137,6 +151,7 @@ let processedImageB64 = null;
 processBtn.addEventListener('click', async () => {
   processBtn.disabled = true;
   document.getElementById('outputPanel').style.display = 'none';
+  document.getElementById('baseImagePanel').style.display = 'none';
   document.getElementById('spinnerWrap').style.display = '';
   statusEl.textContent = 'Sending to Gemini...';
   statusEl.className = 'status';
