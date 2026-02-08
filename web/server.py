@@ -47,11 +47,8 @@ job_counter = 0
 job_lock = threading.Lock()
 
 
-def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[bool, str]:
-    """Send image to Gemini, return (success, base64_image_or_error)."""
-    image_b64 = base64.b64encode(image_bytes).decode()
-    text = prompt.strip() if prompt.strip() else GEMINI_PROMPT_PREFIX
-
+def _call_gemini_once(image_b64: str, mime_type: str, text: str, temperature: float = 0.2) -> tuple[bool, str, bool]:
+    """Single Gemini API call. Returns (success, base64_image_or_error, is_content_blocked)."""
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/"
         f"models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -61,7 +58,7 @@ def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[b
             {"inlineData": {"mimeType": mime_type, "data": image_b64}},
             {"text": text},
         ]}],
-        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"], "temperature": 0.2},
+        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"], "temperature": temperature},
     }
 
     req = urllib.request.Request(url, data=json.dumps(payload).encode(),
@@ -71,15 +68,70 @@ def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[b
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")[:500]
-        return False, f"Gemini API error {e.code}: {body}"
+        return False, f"Gemini API error {e.code}: {body}", False
     except Exception as e:
-        return False, str(e)
+        return False, str(e), False
 
+    # Check for blocked content
+    if "promptFeedback" in result:
+        feedback = result["promptFeedback"]
+        block_reason = feedback.get("blockReason", "")
+        if block_reason:
+            print(f"  Gemini blocked: {block_reason}")
+            return False, f"Gemini blocked the request: {block_reason}", True
+
+    # Extract image and text from response
+    gemini_text = ""
+    content_blocked = False
     for candidate in result.get("candidates", []):
+        finish_reason = candidate.get("finishReason", "")
         for part in candidate.get("content", {}).get("parts", []):
             if "inlineData" in part:
-                return True, part["inlineData"]["data"]
-    return False, "Gemini returned no image"
+                return True, part["inlineData"]["data"], False
+            if "text" in part:
+                gemini_text = part["text"]
+                print(f"  Gemini text response: {gemini_text[:300]}")
+        if finish_reason == "OTHER":
+            # "OTHER" typically means content safety filter blocked image generation
+            print(f"  Gemini finishReason: OTHER (content filter)")
+            content_blocked = True
+        elif finish_reason and finish_reason != "STOP":
+            print(f"  Gemini finishReason: {finish_reason}")
+
+    # No image returned
+    if content_blocked:
+        msg = ("Gemini's content filter blocked image generation. "
+               "This often happens with copyrighted characters (e.g. Marvel, Disney) "
+               "or content that triggers safety filters. Try rephrasing your description "
+               "to avoid trademarked names.")
+        if gemini_text:
+            msg += f" Gemini said: {gemini_text[:200]}"
+        return False, msg, True
+    if gemini_text:
+        return False, f"Gemini returned text instead of image: {gemini_text[:300]}", False
+    return False, "Gemini returned no image (empty response)", False
+
+
+def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "", max_retries: int = 3) -> tuple[bool, str]:
+    """Send image to Gemini with retry logic. Returns (success, base64_image_or_error)."""
+    image_b64 = base64.b64encode(image_bytes).decode()
+    text = prompt.strip() if prompt.strip() else GEMINI_PROMPT_PREFIX
+
+    last_error = ""
+    for attempt in range(1, max_retries + 1):
+        print(f"  Gemini attempt {attempt}/{max_retries}...")
+        success, result, content_blocked = _call_gemini_once(image_b64, mime_type, text)
+        if success:
+            return True, result
+        last_error = result
+        print(f"  Attempt {attempt} failed: {last_error[:200]}")
+        # Don't retry if it's a content policy block — it'll keep failing
+        if content_blocked:
+            return False, last_error
+        if attempt < max_retries:
+            time.sleep(2)  # Brief pause before retry
+
+    return False, last_error
 
 
 def _rodin_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
