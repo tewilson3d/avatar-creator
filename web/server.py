@@ -47,6 +47,12 @@ jobs = {}  # job_id -> {"status": "running"|"done"|"error", "result": ..., "erro
 job_counter = 0
 job_lock = threading.Lock()
 
+# Admin auth
+import hashlib, secrets
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "andyprez69")
+admin_sessions = set()  # valid session tokens
+
 
 def _call_gemini_once(image_b64: str, mime_type: str, text: str, temperature: float = 0.2) -> tuple[bool, str, bool]:
     """Single Gemini API call. Returns (success, base64_image_or_error, is_content_blocked)."""
@@ -326,6 +332,27 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
+    def _get_session(self):
+        """Extract session token from cookie."""
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            part = part.strip()
+            if part.startswith("admin_session="):
+                return part.split("=", 1)[1]
+        return None
+
+    def _is_admin_authed(self):
+        """Check if request has valid admin session."""
+        token = self._get_session()
+        return token in admin_sessions if token else False
+
+    def _require_admin(self):
+        """Return True if authed, otherwise send 401 and return False."""
+        if self._is_admin_authed():
+            return True
+        self._json_response({"error": "Unauthorized"}, 401)
+        return False
+
     def do_GET(self):
         if self.path.startswith("/models/"):
             filename = self.path.split("/models/")[-1]
@@ -375,14 +402,26 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path == "/api/outputs":
             return self._handle_list_outputs()
+        if self.path == "/admin/login":
+            return self._serve_admin_login()
+        if self.path == "/api/admin/check":
+            return self._json_response({"authed": self._is_admin_authed()})
+        if self.path == "/admin":
+            if not self._is_admin_authed():
+                self.send_response(302)
+                self.send_header("Location", "/admin/login")
+                self.end_headers()
+                return
+            return self._serve_admin()
         if self.path == "/api/admin/config":
+            if not self._require_admin(): return
             return self._handle_get_config()
         if self.path == "/api/admin/prompt-prefix":
+            if not self._require_admin(): return
             return self._handle_get_prompt_prefix()
         if self.path == "/api/admin/settings":
+            if not self._require_admin(): return
             return self._handle_get_settings()
-        if self.path == "/admin":
-            return self._serve_admin()
         if self.path.startswith("/api/job/"):
             job_id = self.path.split("/api/job/")[-1]
             if job_id in jobs:
@@ -399,13 +438,21 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_process()
         if self.path == "/api/generate-blend":
             return self._handle_generate_blend()
+        if self.path == "/api/admin/login":
+            return self._handle_login()
+        if self.path == "/api/admin/logout":
+            return self._handle_logout()
         if self.path == "/api/admin/config":
+            if not self._require_admin(): return
             return self._handle_save_config()
         if self.path == "/api/admin/prompt-prefix":
+            if not self._require_admin(): return
             return self._handle_save_prompt_prefix()
         if self.path == "/api/admin/settings":
+            if not self._require_admin(): return
             return self._handle_save_settings()
         if self.path == "/api/admin/cleanup":
+            if not self._require_admin(): return
             return self._handle_cleanup()
         self.send_error(404)
 
@@ -659,6 +706,53 @@ class Handler(SimpleHTTPRequestHandler):
         self._update_env_key("GEMINI_PROMPT_PREFIX", new_prefix)
         print(f"Updated GEMINI_PROMPT_PREFIX: {new_prefix[:80]}...")
         self._json_response({"success": True})
+
+    def _handle_login(self):
+        """Authenticate admin user."""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        username = data.get("username", "")
+        password = data.get("password", "")
+        if username == ADMIN_USER and password == ADMIN_PASS:
+            token = secrets.token_hex(32)
+            admin_sessions.add(token)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Set-Cookie", f"admin_session={token}; Path=/; HttpOnly; SameSite=Strict")
+            body = json.dumps({"success": True}).encode()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            print(f"Admin login successful")
+        else:
+            self._json_response({"success": False, "error": "Invalid credentials"}, 401)
+
+    def _handle_logout(self):
+        """Logout admin session."""
+        token = self._get_session()
+        if token:
+            admin_sessions.discard(token)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Set-Cookie", "admin_session=; Path=/; HttpOnly; Max-Age=0")
+        body = json.dumps({"success": True}).encode()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_admin_login(self):
+        """Serve the admin login page."""
+        login_path = WEB_DIR / "admin_login.html"
+        if login_path.exists():
+            data = login_path.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self.send_error(404)
 
     def _serve_admin(self):
         """Serve the admin page."""
