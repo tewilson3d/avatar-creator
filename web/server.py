@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
-"""Web server for Avatar Pipeline - Gemini image processing + Trellis 2 3D generation."""
+"""Web server for Avatar Pipeline - Gemini image processing + Rodin 3D generation."""
 import os
 import sys
 import json
 import base64
 import time
+import hashlib
+import secrets
+import subprocess
 import threading
 import urllib.request
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
+# Allow imports from scripts/ directory
+SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+
+from lib.gemini import call_gemini_with_retry
+from lib.rodin import make_multipart, submit_task, poll_status, download_results
+
 PORT = 8000
 WEB_DIR = Path(__file__).parent
 BASE_DIR = Path(__file__).parent.parent
 MODELS_DIR = BASE_DIR / "models"
+OUTPUT_DIR = BASE_DIR / "output"
+TEMPLATES_DIR = BASE_DIR / "templates"
 ENV_FILE = BASE_DIR / ".env"
 
 
@@ -28,207 +40,93 @@ def load_env():
 
 
 load_env()
-OUTPUT_DIR = Path(__file__).parent.parent / "output"
-TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
-SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
-MODEL = "gemini-3-pro-image-preview"
-RODIN_BASE_URL = "https://api.hyper3d.com/api/v2"
+GEMINI_MODEL = "gemini-3-pro-image-preview"
 
 DEFAULT_GEMINI_PROMPT_PREFIX = (
-    "keep the exact same style, proportions and pose, please change the character to look the following, but do not add a face:"
+    "keep the exact same style, proportions and pose, please change the character "
+    "to look the following, but do not add a face:"
 )
 GEMINI_PROMPT_PREFIX = os.environ.get("GEMINI_PROMPT_PREFIX", DEFAULT_GEMINI_PROMPT_PREFIX)
 SHOW_BASE_IMAGE = os.environ.get("SHOW_BASE_IMAGE", "true").lower() == "true"
 
 # Async job tracking
-jobs = {}  # job_id -> {"status": "running"|"done"|"error", "result": ..., "error": ...}
+jobs = {}  # job_id -> {"status": ..., "result": ..., "error": ...}
 job_counter = 0
 job_lock = threading.Lock()
 
 # Admin auth
-import hashlib, secrets
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "andyprez69")
 admin_sessions = set()  # valid session tokens
 
 
-def _call_gemini_once(image_b64: str, mime_type: str, text: str, temperature: float = 0.2) -> tuple[bool, str, bool]:
-    """Single Gemini API call. Returns (success, base64_image_or_error, is_content_blocked)."""
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/"
-        f"models/{MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-    payload = {
-        "contents": [{"parts": [
-            {"inlineData": {"mimeType": mime_type, "data": image_b64}},
-            {"text": text},
-        ]}],
-        "generationConfig": {"responseModalities": ["IMAGE", "TEXT"], "temperature": temperature},
-    }
+# =============================================================================
+# GEMINI WRAPPER (uses shared lib)
+# =============================================================================
 
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            result = json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:500]
-        return False, f"Gemini API error {e.code}: {body}", False
-    except Exception as e:
-        return False, str(e), False
-
-    # Check for blocked content
-    if "promptFeedback" in result:
-        feedback = result["promptFeedback"]
-        block_reason = feedback.get("blockReason", "")
-        if block_reason:
-            print(f"  Gemini blocked: {block_reason}")
-            return False, f"Gemini blocked the request: {block_reason}", True
-
-    # Extract image and text from response
-    gemini_text = ""
-    content_blocked = False
-    for candidate in result.get("candidates", []):
-        finish_reason = candidate.get("finishReason", "")
-        for part in candidate.get("content", {}).get("parts", []):
-            if "inlineData" in part:
-                return True, part["inlineData"]["data"], False
-            if "text" in part:
-                gemini_text = part["text"]
-                print(f"  Gemini text response: {gemini_text[:300]}")
-        if finish_reason == "OTHER":
-            # "OTHER" typically means content safety filter blocked image generation
-            print(f"  Gemini finishReason: OTHER (content filter)")
-            content_blocked = True
-        elif finish_reason and finish_reason != "STOP":
-            print(f"  Gemini finishReason: {finish_reason}")
-
-    # No image returned
-    if content_blocked:
-        msg = ("Gemini's content filter blocked image generation. "
-               "This often happens with copyrighted characters (e.g. Marvel, Disney) "
-               "or content that triggers safety filters. Try rephrasing your description "
-               "to avoid trademarked names.")
-        if gemini_text:
-            msg += f" Gemini said: {gemini_text[:200]}"
-        return False, msg, True
-    if gemini_text:
-        return False, f"Gemini returned text instead of image: {gemini_text[:300]}", False
-    return False, "Gemini returned no image (empty response)", False
-
-
-def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "", max_retries: int = 3) -> tuple[bool, str]:
-    """Send image to Gemini with retry logic. Returns (success, base64_image_or_error)."""
+def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[bool, str]:
+    """Send image to Gemini with retry. Returns (success, base64_image_or_error)."""
     image_b64 = base64.b64encode(image_bytes).decode()
     text = prompt.strip() if prompt.strip() else GEMINI_PROMPT_PREFIX
 
-    last_error = ""
-    for attempt in range(1, max_retries + 1):
-        print(f"  Gemini attempt {attempt}/{max_retries}...")
-        success, result, content_blocked = _call_gemini_once(image_b64, mime_type, text)
-        if success:
-            return True, result
-        last_error = result
-        print(f"  Attempt {attempt} failed: {last_error[:200]}")
-        # Don't retry if it's a content policy block — it'll keep failing
-        if content_blocked:
-            return False, last_error
-        if attempt < max_retries:
-            time.sleep(2)  # Brief pause before retry
+    success, result = call_gemini_with_retry(
+        api_key=GEMINI_API_KEY,
+        image_b64=image_b64,
+        mime_type=mime_type,
+        prompt=text,
+        model=GEMINI_MODEL,
+        max_retries=3,
+    )
 
-    return False, last_error
+    if success:
+        # Return base64-encoded for JSON response
+        return True, base64.b64encode(result).decode()
+    return False, result
 
 
-def _rodin_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
-    """Build multipart/form-data body."""
-    import uuid as _uuid
-    boundary = f"----PipelineBoundary{_uuid.uuid4().hex}"
-    body = b""
-    for key, value in fields.items():
-        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n".encode()
-    for key, (filename, data, mime) in files.items():
-        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"; filename=\"{filename}\"\r\nContent-Type: {mime}\r\n\r\n".encode()
-        body += data + b"\r\n"
-    body += f"--{boundary}--\r\n".encode()
-    return body, f"multipart/form-data; boundary={boundary}"
-
+# =============================================================================
+# 3D PIPELINE (uses shared lib)
+# =============================================================================
 
 def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = None):
-    """Full pipeline in background thread: Rodin → Scale → Rig Transfer → .blend
-    Updates jobs[job_id] with status throughout."""
+    """Full pipeline in background thread: Rodin → Scale → Rig Transfer → .blend"""
     try:
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        # =====================================================================
-        # Phase 1: Rodin 3D Generation
-        # =====================================================================
+        # Phase 1: Rodin 3D Generation (using shared lib)
         print(f"[Job {job_id}] Submitting to Rodin Sketch...")
         jobs[job_id]["status"] = "submitting"
 
-        fields = {"tier": "Sketch", "geometry_file_format": "glb", "material": "PBR"}
-        files_data = {"images": ("character.png", image_bytes, "image/png")}
-        body, content_type = _rodin_multipart(fields, files_data)
-
-        req = urllib.request.Request(
-            f"{RODIN_BASE_URL}/rodin", data=body,
-            headers={"Authorization": f"Bearer {RODIN_API_KEY}", "Content-Type": content_type},
-            method="POST"
+        task = submit_task(
+            api_key=RODIN_API_KEY,
+            image_bytes=image_bytes,
+            filename="character.png",
+            mime_type="image/png",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read())
-
-        if result.get("error"):
-            raise Exception(f"Rodin error: {result['error']} - {result.get('message', '')}")
-
-        task_uuid = result["uuid"]
-        subscription_key = result["jobs"]["subscription_key"]
+        task_uuid = task["uuid"]
+        subscription_key = task["jobs"]["subscription_key"]
         print(f"[Job {job_id}] Task UUID: {task_uuid}")
 
         jobs[job_id]["status"] = "generating"
-        start = time.time()
-        while time.time() - start < 300:
-            time.sleep(5)
-            req = urllib.request.Request(
-                f"{RODIN_BASE_URL}/status",
-                data=json.dumps({"subscription_key": subscription_key}).encode(),
-                headers={"Authorization": f"Bearer {RODIN_API_KEY}", "Content-Type": "application/json"},
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status_result = json.loads(resp.read())
-
-            job_list = status_result.get("jobs", [])
-            for j in job_list:
-                elapsed = int(time.time() - start)
-                print(f"  [{elapsed}s] Job {j['uuid']}: {j['status']}")
-
-            if job_list and all(j["status"] in ("Done", "Failed") for j in job_list):
-                if any(j["status"] == "Failed" for j in job_list):
-                    raise Exception("Rodin job failed")
-                break
-        else:
-            raise Exception("Rodin timed out after 300s")
+        if not poll_status(RODIN_API_KEY, subscription_key, timeout_sec=300):
+            raise Exception("Rodin job failed or timed out")
 
         print(f"[Job {job_id}] Downloading Rodin results...")
         jobs[job_id]["status"] = "downloading"
-        req = urllib.request.Request(
-            f"{RODIN_BASE_URL}/download",
-            data=json.dumps({"task_uuid": task_uuid}).encode(),
-            headers={"Authorization": f"Bearer {RODIN_API_KEY}", "Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            dl_result = json.loads(resp.read())
+        downloaded = download_results(RODIN_API_KEY, task_uuid, str(MODELS_DIR))
 
+        # Rename downloaded files with job prefix
         raw_glb = None
-        for item in dl_result.get("list", []):
-            name = item["name"]
+        for src_path in downloaded:
+            name = os.path.basename(src_path)
             dest = MODELS_DIR / f"job{job_id}_raw_{name}"
-            urllib.request.urlretrieve(item["url"], str(dest))
-            print(f"  Downloaded: {dest}")
+            if src_path != str(dest):
+                os.rename(src_path, dest)
+            print(f"  Saved: {dest}")
             if name.endswith(".glb"):
                 raw_glb = dest
 
@@ -237,9 +135,7 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
 
         print(f"[Job {job_id}] Raw mesh: {raw_glb}")
 
-        # =====================================================================
-        # Phase 2: Scale (if we have source image with alpha)
-        # =====================================================================
+        # Phase 2: Scale
         scaled_glb = MODELS_DIR / f"job{job_id}_scaled.glb"
         if source_image_path and Path(source_image_path).exists():
             print(f"[Job {job_id}] Scaling mesh...")
@@ -254,15 +150,11 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             print(f"[Job {job_id}] No source image for scaling, using raw mesh")
             scaled_glb = raw_glb
 
-        # =====================================================================
         # Phase 3: Retopology (TEMPORARILY DISABLED)
-        # =====================================================================
         retopo_glb = scaled_glb
         print(f"[Job {job_id}] Retopology SKIPPED (temporarily disabled)")
 
-        # =====================================================================
         # Phase 4: Rig Transfer
-        # =====================================================================
         rig_path = TEMPLATES_DIR / "rig.fbx"
         rigged_fbx = OUTPUT_DIR / f"job{job_id}_rigged.fbx"
 
@@ -274,9 +166,7 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
         if not ok:
             raise Exception(f"Rig transfer failed: {msg}")
 
-        # =====================================================================
         # Phase 5: Comparison .blend
-        # =====================================================================
         comparison_blend = OUTPUT_DIR / f"job{job_id}_comparison.blend"
 
         print(f"[Job {job_id}] Saving comparison .blend...")
@@ -288,9 +178,7 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             print(f"[Job {job_id}] Comparison blend failed (non-fatal): {msg}")
             comparison_blend = None
 
-        # =====================================================================
         # Done!
-        # =====================================================================
         print(f"[Job {job_id}] Pipeline complete!")
         jobs[job_id]["status"] = "done"
         result_data = {
@@ -314,7 +202,6 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
 
 def run_blender_script(script_name: str, args: list[str], label: str = "") -> tuple[bool, str]:
     """Run a Blender script. Returns (success, stdout_or_error)."""
-    import subprocess
     script = str(SCRIPTS_DIR / script_name)
     cmd = ["blender", "--background", "--python", script, "--"] + args
     print(f"[{label}] Running: {' '.join(cmd)}")
@@ -328,12 +215,17 @@ def run_blender_script(script_name: str, args: list[str], label: str = "") -> tu
     return True, result.stdout
 
 
+# =============================================================================
+# HTTP HANDLER
+# =============================================================================
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
+    # --- Auth helpers ---
+
     def _get_session(self):
-        """Extract session token from cookie."""
         cookie = self.headers.get("Cookie", "")
         for part in cookie.split(";"):
             part = part.strip()
@@ -342,68 +234,62 @@ class Handler(SimpleHTTPRequestHandler):
         return None
 
     def _is_admin_authed(self):
-        """Check if request has valid admin session."""
         token = self._get_session()
         return token in admin_sessions if token else False
 
     def _require_admin(self):
-        """Return True if authed, otherwise send 401 and return False."""
         if self._is_admin_authed():
             return True
         self._json_response({"error": "Unauthorized"}, 401)
         return False
+
+    # --- Response helpers ---
+
+    def _json_response(self, data, status=200):
+        body = json.dumps(data).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_file(self, filepath, content_type=None, attachment=False):
+        if not filepath.exists():
+            self.send_error(404, f"File not found: {filepath.name}")
+            return
+        data = filepath.read_bytes()
+        ct_map = {
+            '.glb': 'model/gltf-binary', '.fbx': 'application/octet-stream',
+            '.blend': 'application/x-blender', '.html': 'text/html',
+            '.py': 'text/x-python',
+        }
+        if not content_type:
+            content_type = ct_map.get(filepath.suffix, 'application/octet-stream')
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if attachment:
+            self.send_header("Content-Disposition", f'attachment; filename="{filepath.name}"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    # --- Routing ---
 
     def do_GET(self):
         if self.path.startswith("/models/"):
             filename = self.path.split("/models/")[-1]
             filepath = MODELS_DIR / filename
             if filepath.exists() and filepath.suffix == ".glb":
-                with open(filepath, "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", "model/gltf-binary")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
+                return self._serve_file(filepath)
         if self.path == "/scripts/combined_scale_retopo_rig.py":
-            script_path = SCRIPTS_DIR / "combined_scale_retopo_rig.py"
-            if script_path.exists():
-                data = script_path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/x-python")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Content-Disposition", 'attachment; filename="combined_scale_retopo_rig.py"')
-                self.end_headers()
-                self.wfile.write(data)
-                return
-            self.send_error(404)
-            return
+            return self._serve_file(SCRIPTS_DIR / "combined_scale_retopo_rig.py", attachment=True)
         if self.path.startswith("/output/"):
             filename = self.path.split("/output/")[-1]
-            filepath = OUTPUT_DIR / filename
-            if filepath.exists():
-                content_types = {
-                    '.fbx': 'application/octet-stream',
-                    '.blend': 'application/x-blender',
-                    '.glb': 'model/gltf-binary',
-                }
-                ct = content_types.get(filepath.suffix, 'application/octet-stream')
-                with open(filepath, "rb") as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header("Content-Type", ct)
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Content-Disposition", f'attachment; filename="{filepath.name}"')
-                self.end_headers()
-                self.wfile.write(data)
-                return
-            self.send_error(404, f"File not found: {filename}")
-            return
+            return self._serve_file(OUTPUT_DIR / filename, attachment=True)
         if self.path == "/api/outputs":
             return self._handle_list_outputs()
         if self.path == "/admin/login":
-            return self._serve_admin_login()
+            return self._serve_file(WEB_DIR / "admin_login.html")
         if self.path == "/api/admin/check":
             return self._json_response({"authed": self._is_admin_authed()})
         if self.path == "/admin":
@@ -412,7 +298,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_header("Location", "/admin/login")
                 self.end_headers()
                 return
-            return self._serve_admin()
+            return self._serve_file(WEB_DIR / "admin.html")
         if self.path == "/api/admin/config":
             if not self._require_admin(): return
             return self._handle_get_config()
@@ -456,6 +342,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._handle_cleanup()
         self.send_error(404)
 
+    # --- API: Image processing ---
+
     def _handle_process(self):
         content_type = self.headers.get("Content-Type", "")
         content_length = int(self.headers.get("Content-Length", 0))
@@ -488,22 +376,19 @@ class Handler(SimpleHTTPRequestHandler):
             self._json_response({"success": False, "error": "No image in request"})
             return
 
-        # Build final prompt: prefix + user input
-        if prompt.strip():
-            final_prompt = GEMINI_PROMPT_PREFIX + " " + prompt.strip()
-        else:
-            final_prompt = GEMINI_PROMPT_PREFIX
+        final_prompt = (GEMINI_PROMPT_PREFIX + " " + prompt.strip()) if prompt.strip() else GEMINI_PROMPT_PREFIX
         print(f"Processing image: {len(image_bytes)} bytes, {mime_type}")
         print(f"Final prompt: {final_prompt[:200]}..." if len(final_prompt) > 200 else f"Final prompt: {final_prompt}")
-        success, result = call_gemini(image_bytes, mime_type, final_prompt)
 
+        success, result = call_gemini(image_bytes, mime_type, final_prompt)
         if success:
             self._json_response({"success": True, "image": result})
         else:
             self._json_response({"success": False, "error": result})
 
+    # --- API: 3D Generation ---
+
     def _handle_generate3d(self):
-        """Start async full pipeline: Rodin → Scale → Rig → .blend. Returns job_id for polling."""
         global job_counter
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
@@ -520,7 +405,6 @@ class Handler(SimpleHTTPRequestHandler):
             job_counter += 1
             job_id = str(job_counter)
 
-        # Save processed image for the scale step (needs alpha bbox)
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         source_image_path = str(MODELS_DIR / f"job{job_id}_source.png")
         with open(source_image_path, "wb") as f:
@@ -530,14 +414,13 @@ class Handler(SimpleHTTPRequestHandler):
         thread = threading.Thread(
             target=generate_3d_rodin,
             args=(image_bytes, job_id, source_image_path),
-            daemon=True
+            daemon=True,
         )
         thread.start()
 
         self._json_response({"success": True, "job_id": job_id})
 
     def _handle_list_outputs(self):
-        """List available output files."""
         files = []
         if OUTPUT_DIR.exists():
             for f in sorted(OUTPUT_DIR.iterdir()):
@@ -551,20 +434,16 @@ class Handler(SimpleHTTPRequestHandler):
         self._json_response({"files": files})
 
     def _handle_generate_blend(self):
-        """Generate a comparison .blend with the output mesh + base rig."""
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         data = json.loads(body) if body else {}
 
-        # Find the mesh to use — either specified or the latest rigged FBX
         mesh_name = data.get("mesh")
         if mesh_name:
             mesh_path = OUTPUT_DIR / mesh_name
         else:
-            # Find latest rigged FBX in output
             fbx_files = sorted(OUTPUT_DIR.glob("*_rigged.fbx"), key=lambda p: p.stat().st_mtime, reverse=True)
             if not fbx_files:
-                # Fallback: any GLB in models
                 glb_files = sorted(MODELS_DIR.glob("*.glb"), key=lambda p: p.stat().st_mtime, reverse=True)
                 if glb_files:
                     mesh_path = glb_files[0]
@@ -578,7 +457,6 @@ class Handler(SimpleHTTPRequestHandler):
         if not rig_path.exists():
             self._json_response({"success": False, "error": "Base rig.fbx not found"})
             return
-
         if not mesh_path.exists():
             self._json_response({"success": False, "error": f"Mesh not found: {mesh_path.name}"})
             return
@@ -586,135 +464,21 @@ class Handler(SimpleHTTPRequestHandler):
         blend_name = mesh_path.stem + "_comparison.blend"
         blend_path = OUTPUT_DIR / blend_name
 
-        success, result = generate_comparison_blend(str(mesh_path), str(rig_path), str(blend_path))
-        if success:
-            self._json_response({
-                "success": True,
-                "url": f"/output/{blend_name}",
-                "filename": blend_name,
-            })
+        ok, msg = run_blender_script("save_comparison_blend.py",
+            [str(mesh_path), str(rig_path), str(blend_path)],
+            label="Generate Blend")
+        if ok:
+            self._json_response({"success": True, "url": f"/output/{blend_name}", "filename": blend_name})
         else:
-            self._json_response({"success": False, "error": result})
+            self._json_response({"success": False, "error": msg})
 
-    def _handle_get_config(self):
-        """Return current config (keys masked)."""
-        config = {}
-        if ENV_FILE.exists():
-            for line in ENV_FILE.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    k, v = line.split('=', 1)
-                    config[k.strip()] = v.strip()
-        # Return with masked values for display, full values for editing
-        items = []
-        for k, v in config.items():
-            if k in ("GEMINI_PROMPT_PREFIX", "SHOW_BASE_IMAGE"):
-                continue  # Managed via dedicated UI sections
-            masked = v[:8] + '...' + v[-4:] if len(v) > 16 else '****'
-            items.append({"key": k, "value": v, "masked": masked})
-        self._json_response({"config": items})
-
-    def _handle_save_config(self):
-        """Save config to .env file."""
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        data = json.loads(body)
-        entries = data.get("config", {})
-        lines = []
-        for k, v in entries.items():
-            lines.append(f"{k}={v}")
-        ENV_FILE.write_text('\n'.join(lines) + '\n')
-        # Reload into environment
-        for k, v in entries.items():
-            os.environ[k] = v
-        # Update global API keys
-        global GEMINI_API_KEY, RODIN_API_KEY
-        GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-        RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
-        self._json_response({"success": True})
-
-    def _handle_get_settings(self):
-        """Return UI settings."""
-        self._json_response({"show_base_image": SHOW_BASE_IMAGE})
-
-    def _handle_save_settings(self):
-        """Save UI settings."""
-        global SHOW_BASE_IMAGE
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        data = json.loads(body)
-        if "show_base_image" in data:
-            SHOW_BASE_IMAGE = bool(data["show_base_image"])
-            os.environ["SHOW_BASE_IMAGE"] = str(SHOW_BASE_IMAGE).lower()
-            self._update_env_key("SHOW_BASE_IMAGE", str(SHOW_BASE_IMAGE).lower())
-            print(f"Updated SHOW_BASE_IMAGE: {SHOW_BASE_IMAGE}")
-        self._json_response({"success": True})
-
-    def _handle_cleanup(self):
-        """Delete all processed files from models/ and output/ directories."""
-        deleted = []
-        kept_extensions = {'.gitkeep'}
-        for directory in [MODELS_DIR, OUTPUT_DIR]:
-            if not directory.exists():
-                continue
-            for f in directory.iterdir():
-                if f.is_file() and f.suffix not in kept_extensions:
-                    try:
-                        f.unlink()
-                        deleted.append(str(f.relative_to(BASE_DIR)))
-                    except Exception as e:
-                        print(f"Failed to delete {f}: {e}")
-        # Reset job tracking
-        global jobs, job_counter
-        jobs = {}
-        job_counter = 0
-        print(f"Cleanup: deleted {len(deleted)} files")
-        self._json_response({"success": True, "deleted": len(deleted), "files": deleted})
-
-    def _update_env_key(self, key, value):
-        """Update a single key in the .env file."""
-        if ENV_FILE.exists():
-            lines = ENV_FILE.read_text().splitlines()
-            found = False
-            for i, line in enumerate(lines):
-                if line.strip().startswith(f"{key}="):
-                    lines[i] = f"{key}={value}"
-                    found = True
-                    break
-            if not found:
-                lines.append(f"{key}={value}")
-            ENV_FILE.write_text('\n'.join(lines) + '\n')
-        else:
-            ENV_FILE.write_text(f"{key}={value}\n")
-
-    def _handle_get_prompt_prefix(self):
-        """Return current Gemini prompt prefix."""
-        self._json_response({"prefix": GEMINI_PROMPT_PREFIX})
-
-    def _handle_save_prompt_prefix(self):
-        """Save Gemini prompt prefix to .env and update in-memory."""
-        global GEMINI_PROMPT_PREFIX
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        data = json.loads(body)
-        new_prefix = data.get("prefix", "").strip()
-        if not new_prefix:
-            self._json_response({"success": False, "error": "Prefix cannot be empty"})
-            return
-        GEMINI_PROMPT_PREFIX = new_prefix
-        os.environ["GEMINI_PROMPT_PREFIX"] = new_prefix
-        self._update_env_key("GEMINI_PROMPT_PREFIX", new_prefix)
-        print(f"Updated GEMINI_PROMPT_PREFIX: {new_prefix[:80]}...")
-        self._json_response({"success": True})
+    # --- API: Admin ---
 
     def _handle_login(self):
-        """Authenticate admin user."""
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         data = json.loads(body)
-        username = data.get("username", "")
-        password = data.get("password", "")
-        if username == ADMIN_USER and password == ADMIN_PASS:
+        if data.get("username") == ADMIN_USER and data.get("password") == ADMIN_PASS:
             token = secrets.token_hex(32)
             admin_sessions.add(token)
             self.send_response(200)
@@ -724,12 +488,11 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            print(f"Admin login successful")
+            print("Admin login successful")
         else:
             self._json_response({"success": False, "error": "Invalid credentials"}, 401)
 
     def _handle_logout(self):
-        """Logout admin session."""
         token = self._get_session()
         if token:
             admin_sessions.discard(token)
@@ -741,43 +504,115 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_admin_login(self):
-        """Serve the admin login page."""
-        login_path = WEB_DIR / "admin_login.html"
-        if login_path.exists():
-            data = login_path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        else:
-            self.send_error(404)
+    def _handle_get_config(self):
+        config = {}
+        if ENV_FILE.exists():
+            for line in ENV_FILE.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    config[k.strip()] = v.strip()
+        items = []
+        for k, v in config.items():
+            if k in ("GEMINI_PROMPT_PREFIX", "SHOW_BASE_IMAGE"):
+                continue
+            masked = v[:8] + '...' + v[-4:] if len(v) > 16 else '****'
+            items.append({"key": k, "value": v, "masked": masked})
+        self._json_response({"config": items})
 
-    def _serve_admin(self):
-        """Serve the admin page."""
-        admin_path = WEB_DIR / "admin.html"
-        if admin_path.exists():
-            data = admin_path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        else:
-            self.send_error(404)
+    def _handle_save_config(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        entries = data.get("config", {})
+        lines = [f"{k}={v}" for k, v in entries.items()]
+        ENV_FILE.write_text('\n'.join(lines) + '\n')
+        for k, v in entries.items():
+            os.environ[k] = v
+        global GEMINI_API_KEY, RODIN_API_KEY
+        GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+        RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
+        self._json_response({"success": True})
 
-    def _json_response(self, data, status=200):
-        body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    def _handle_get_settings(self):
+        self._json_response({"show_base_image": SHOW_BASE_IMAGE})
+
+    def _handle_save_settings(self):
+        global SHOW_BASE_IMAGE
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        if "show_base_image" in data:
+            SHOW_BASE_IMAGE = bool(data["show_base_image"])
+            os.environ["SHOW_BASE_IMAGE"] = str(SHOW_BASE_IMAGE).lower()
+            _update_env_key("SHOW_BASE_IMAGE", str(SHOW_BASE_IMAGE).lower())
+            print(f"Updated SHOW_BASE_IMAGE: {SHOW_BASE_IMAGE}")
+        self._json_response({"success": True})
+
+    def _handle_cleanup(self):
+        deleted = []
+        for directory in [MODELS_DIR, OUTPUT_DIR]:
+            if not directory.exists():
+                continue
+            for f in directory.iterdir():
+                if f.is_file() and f.suffix != '.gitkeep':
+                    try:
+                        f.unlink()
+                        deleted.append(str(f.relative_to(BASE_DIR)))
+                    except Exception as e:
+                        print(f"Failed to delete {f}: {e}")
+        global jobs, job_counter
+        jobs = {}
+        job_counter = 0
+        print(f"Cleanup: deleted {len(deleted)} files")
+        self._json_response({"success": True, "deleted": len(deleted), "files": deleted})
+
+    def _handle_get_prompt_prefix(self):
+        self._json_response({"prefix": GEMINI_PROMPT_PREFIX})
+
+    def _handle_save_prompt_prefix(self):
+        global GEMINI_PROMPT_PREFIX
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+        new_prefix = data.get("prefix", "").strip()
+        if not new_prefix:
+            self._json_response({"success": False, "error": "Prefix cannot be empty"})
+            return
+        GEMINI_PROMPT_PREFIX = new_prefix
+        os.environ["GEMINI_PROMPT_PREFIX"] = new_prefix
+        _update_env_key("GEMINI_PROMPT_PREFIX", new_prefix)
+        print(f"Updated GEMINI_PROMPT_PREFIX: {new_prefix[:80]}...")
+        self._json_response({"success": True})
 
     def log_message(self, format, *args):
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
 
+
+# =============================================================================
+# .env helpers
+# =============================================================================
+
+def _update_env_key(key, value):
+    """Update a single key in the .env file."""
+    if ENV_FILE.exists():
+        lines = ENV_FILE.read_text().splitlines()
+        found = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith(f"{key}="):
+                lines[i] = f"{key}={value}"
+                found = True
+                break
+        if not found:
+            lines.append(f"{key}={value}")
+        ENV_FILE.write_text('\n'.join(lines) + '\n')
+    else:
+        ENV_FILE.write_text(f"{key}={value}\n")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     if not GEMINI_API_KEY:
@@ -785,7 +620,7 @@ def main():
         sys.exit(1)
     server = HTTPServer(("", PORT), Handler)
     print(f"Server running on http://localhost:{PORT}", flush=True)
-    print(f"Gemini model: {MODEL}", flush=True)
+    print(f"Gemini model: {GEMINI_MODEL}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

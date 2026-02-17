@@ -2,42 +2,25 @@
 """Save a .blend file with the generated mesh + base rig.fbx side by side for comparison.
 
 Run via: blender --background --python save_comparison_blend.py -- <mesh_path> <rig_fbx_path> <output_blend_path>
-
-Imports both into one scene, offsets the rig to the right so you can compare.
 """
-import bpy
 import sys
 import os
+
+# Allow imports from scripts/ directory
+sys.path.insert(0, str(os.path.join(os.path.dirname(os.path.abspath(__file__)))))
+
+import bpy
 import mathutils
-
-
-def get_bounds(objects):
-    """Get combined bounding box of a list of objects."""
-    mn = mathutils.Vector((float('inf'),) * 3)
-    mx = mathutils.Vector((float('-inf'),) * 3)
-    for obj in objects:
-        if obj.type == 'MESH':
-            for v in obj.data.vertices:
-                co = obj.matrix_world @ v.co
-                for i in range(3):
-                    mn[i] = min(mn[i], co[i])
-                    mx[i] = max(mx[i], co[i])
-        elif obj.type == 'ARMATURE':
-            for b in obj.data.bones:
-                co = obj.matrix_world @ b.head_local
-                for i in range(3):
-                    mn[i] = min(mn[i], co[i])
-                    mx[i] = max(mx[i], co[i])
-    return mn, mx, mx - mn, (mn + mx) / 2
+from lib.blender_utils import (
+    clear_scene, import_model, get_combined_bounds, parse_blender_args,
+)
 
 
 def main():
-    argv = sys.argv
-    args = argv[argv.index("--") + 1:] if "--" in argv else []
-
-    if len(args) < 3:
-        print("Usage: blender --background --python save_comparison_blend.py -- <mesh> <rig.fbx> <output.blend>")
-        sys.exit(1)
+    args = parse_blender_args(
+        min_args=3,
+        usage="Usage: blender --background --python save_comparison_blend.py -- <mesh> <rig.fbx> <output.blend>"
+    )
 
     mesh_path = args[0]
     rig_path = args[1]
@@ -46,29 +29,18 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     # Clear scene
-    bpy.ops.wm.read_factory_settings(use_empty=True)
+    clear_scene()
 
     # =========================================================================
-    # Import the generated mesh (GLB or FBX)
+    # Import the generated mesh
     # =========================================================================
     print(f"\n=== Importing generated mesh: {mesh_path} ===")
-    ext = os.path.splitext(mesh_path)[1].lower()
-    if ext == '.glb' or ext == '.gltf':
-        bpy.ops.import_scene.gltf(filepath=mesh_path)
-    elif ext == '.fbx':
-        bpy.ops.import_scene.fbx(filepath=mesh_path)
-    elif ext == '.obj':
-        bpy.ops.wm.obj_import(filepath=mesh_path)
-    else:
-        print(f"ERROR: Unsupported mesh format: {ext}")
-        sys.exit(1)
+    import_model(mesh_path)
 
-    # Collect generated mesh objects
     gen_objects = list(bpy.context.scene.objects)
     gen_meshes = [o for o in gen_objects if o.type == 'MESH']
     print(f"Generated mesh objects: {[o.name for o in gen_meshes]}")
 
-    # Tag generated objects with a color for easy identification
     for obj in gen_objects:
         obj.color = (0.2, 0.8, 0.4, 1.0)  # Green tint
 
@@ -77,31 +49,25 @@ def main():
     # =========================================================================
     print(f"\n=== Importing base rig: {rig_path} ===")
     before_import = set(bpy.context.scene.objects)
-    bpy.ops.import_scene.fbx(filepath=rig_path)
+    import_model(rig_path)
     rig_objects = [o for o in bpy.context.scene.objects if o not in before_import]
-    rig_meshes = [o for o in rig_objects if o.type == 'MESH']
-    rig_armatures = [o for o in rig_objects if o.type == 'ARMATURE']
     print(f"Rig objects: {[o.name for o in rig_objects]}")
 
-    # Tag rig objects
     for obj in rig_objects:
         obj.color = (0.4, 0.4, 0.8, 1.0)  # Blue tint
 
     # =========================================================================
-    # Offset the rig to the right so they sit side by side
+    # Offset the rig to the right
     # =========================================================================
     print(f"\n=== Positioning side by side ===")
 
     if gen_meshes:
-        gen_mn, gen_mx, gen_size, gen_center = get_bounds(gen_meshes)
+        _, _, gen_size, _ = get_combined_bounds(gen_meshes)
         print(f"Generated mesh bounds: size={gen_size.x:.3f}x{gen_size.y:.3f}x{gen_size.z:.3f}")
     else:
         gen_size = mathutils.Vector((1, 1, 1))
 
-    # Offset rig objects to the right
-    offset_x = gen_size.x * 1.5 + 0.5  # 1.5x width + gap
-
-    # Find the root rig objects (no parent or parent not in rig_objects)
+    offset_x = gen_size.x * 1.5 + 0.5
     rig_roots = [o for o in rig_objects if o.parent is None or o.parent not in rig_objects]
     for obj in rig_roots:
         obj.location.x += offset_x
@@ -110,7 +76,6 @@ def main():
     # =========================================================================
     # Organize into collections
     # =========================================================================
-    # Create collections
     gen_col = bpy.data.collections.new("Generated Mesh")
     rig_col = bpy.data.collections.new("Base Rig (template)")
     bpy.context.scene.collection.children.link(gen_col)
@@ -127,11 +92,9 @@ def main():
         rig_col.objects.link(obj)
 
     # =========================================================================
-    # Set up lighting and camera
+    # Set up lighting
     # =========================================================================
     print(f"\n=== Setting up scene ===")
-
-    # Add a light
     light_data = bpy.data.lights.new(name="Sun", type='SUN')
     light_data.energy = 3.0
     light_obj = bpy.data.objects.new(name="Sun", object_data=light_data)
@@ -143,7 +106,7 @@ def main():
     print(f"\n=== Saving: {output_path} ===")
     bpy.ops.wm.save_as_mainfile(filepath=os.path.abspath(output_path))
 
-    print(f"\n✓ Comparison .blend saved: {output_path}")
+    print(f"\n\u2713 Comparison .blend saved: {output_path}")
     print(f"  - 'Generated Mesh' collection: {len(gen_objects)} objects")
     print(f"  - 'Base Rig (template)' collection: {len(rig_objects)} objects")
 
