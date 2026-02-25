@@ -93,6 +93,7 @@
     <a class="btn btn-primary" id="downloadBtn" style="display:none;text-decoration:none" download>⬇ Download GLB</a>
     <a class="btn btn-primary" id="downloadFbxBtn" style="display:none;text-decoration:none" download>📦 Download FBX</a>
     <a class="btn btn-primary" id="downloadBlendBtn" style="display:none;text-decoration:none" download>🟠 Download .blend</a>
+    <a class="btn btn-primary" id="downloadZipBtn" style="display:none;text-decoration:none" download>📁 Download All (.zip)</a>
   </div>
   <div class="status" id="status3d"></div>
 
@@ -197,6 +198,7 @@ generate3dBtn.addEventListener('click', async () => {
   generate3dBtn.disabled = true;
   document.getElementById('downloadFbxBtn').style.display = 'none';
   document.getElementById('downloadBlendBtn').style.display = 'none';
+  document.getElementById('downloadZipBtn').style.display = 'none';
   downloadBtn.style.display = 'none';
   status3d.textContent = 'Starting pipeline: Rodin → Scale → Rig → FBX...';
   status3d.className = 'status';
@@ -259,6 +261,11 @@ generate3dBtn.addEventListener('click', async () => {
             blendBtn.download = job.result.blend_filename;
             blendBtn.style.display = '';
           }
+          // Zip download (all files)
+          const zipBtn = document.getElementById('downloadZipBtn');
+          zipBtn.href = `/api/job/${jobId}/zip`;
+          zipBtn.download = `job${jobId}_avatar.zip`;
+          zipBtn.style.display = '';
           break;
         } else if (job.status === 'error') {
           status3d.textContent = '❌ Error: ' + (job.error || 'Unknown');

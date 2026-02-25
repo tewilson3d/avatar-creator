@@ -10,6 +10,8 @@ import secrets
 import subprocess
 import threading
 import urllib.request
+import zipfile
+import io
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -304,6 +306,60 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # --- Zip bundle ---
+
+    def _handle_job_zip(self, job_id):
+        """Create and serve a zip of all job outputs (FBX, GLB, .blend, source PNG)."""
+        if job_id not in jobs or jobs[job_id].get("status") != "done":
+            return self._json_response({"error": "Job not found or not complete"}, 404)
+
+        result = jobs[job_id].get("result", {})
+        files_to_zip = []
+
+        # Source PNG
+        source_png = MODELS_DIR / f"job{job_id}_source.png"
+        if source_png.exists():
+            files_to_zip.append((source_png, f"source.png"))
+
+        # Raw GLB
+        glb_filename = result.get("glb_filename", "")
+        if glb_filename:
+            glb_path = MODELS_DIR / glb_filename
+            if glb_path.exists():
+                files_to_zip.append((glb_path, glb_filename))
+
+        # Rigged FBX
+        fbx_filename = result.get("fbx_filename", "")
+        if fbx_filename:
+            fbx_path = OUTPUT_DIR / fbx_filename
+            if fbx_path.exists():
+                files_to_zip.append((fbx_path, fbx_filename))
+
+        # Comparison .blend
+        blend_filename = result.get("blend_filename", "")
+        if blend_filename:
+            blend_path = OUTPUT_DIR / blend_filename
+            if blend_path.exists():
+                files_to_zip.append((blend_path, blend_filename))
+
+        if not files_to_zip:
+            return self._json_response({"error": "No files found for this job"}, 404)
+
+        # Build zip in memory
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for filepath, arcname in files_to_zip:
+                zf.write(filepath, arcname)
+        zip_bytes = buf.getvalue()
+
+        zip_name = f"job{job_id}_avatar.zip"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(zip_bytes)))
+        self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
+        self.end_headers()
+        self.wfile.write(zip_bytes)
+
     # --- Routing ---
 
     def do_GET(self):
@@ -342,13 +398,16 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/admin/rodin-settings":
             if not self._require_admin(): return
             return self._handle_get_rodin_settings()
-        if self.path.startswith("/api/job/"):
+        if self.path.startswith("/api/job/") and "/zip" not in self.path:
             job_id = self.path.split("/api/job/")[-1]
             if job_id in jobs:
                 self._json_response(jobs[job_id])
             else:
                 self._json_response({"status": "not_found"}, 404)
             return
+        if self.path.startswith("/api/job/") and self.path.endswith("/zip"):
+            job_id = self.path.split("/api/job/")[1].split("/zip")[0]
+            return self._handle_job_zip(job_id)
         return super().do_GET()
 
     def do_POST(self):
