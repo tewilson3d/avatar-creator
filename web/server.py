@@ -220,6 +220,8 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             "fbx_url": f"/output/{rigged_fbx.name}",
             "fbx_filename": rigged_fbx.name,
         }
+        if scaled_glb and scaled_glb.exists() and scaled_glb != raw_glb:
+            result_data["scaled_glb_filename"] = scaled_glb.name
         if comparison_blend and comparison_blend.exists():
             result_data["blend_url"] = f"/output/{comparison_blend.name}"
             result_data["blend_filename"] = comparison_blend.name
@@ -324,6 +326,13 @@ class Handler(SimpleHTTPRequestHandler):
             glb_path = MODELS_DIR / glb_filename
             if glb_path.exists():
                 files_to_zip.append((glb_path, glb_filename))
+
+        # Scaled GLB (high-res mesh)
+        scaled_glb_filename = result.get("scaled_glb_filename", "")
+        if scaled_glb_filename:
+            scaled_path = MODELS_DIR / scaled_glb_filename
+            if scaled_path.exists():
+                files_to_zip.append((scaled_path, scaled_glb_filename))
 
         # Rigged FBX
         fbx_filename = result.get("fbx_filename", "")
