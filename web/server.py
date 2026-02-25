@@ -271,10 +271,7 @@ class Handler(SimpleHTTPRequestHandler):
         return token in admin_sessions if token else False
 
     def _require_admin(self):
-        if self._is_admin_authed():
-            return True
-        self._json_response({"error": "Unauthorized"}, 401)
-        return False
+        return True
 
     # --- Response helpers ---
 
@@ -380,11 +377,6 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/admin/check":
             return self._json_response({"authed": self._is_admin_authed()})
         if self.path == "/admin":
-            if not self._is_admin_authed():
-                self.send_response(302)
-                self.send_header("Location", "/admin/login")
-                self.end_headers()
-                return
             return self._serve_file(WEB_DIR / "admin.html")
         if self.path == "/api/admin/config":
             if not self._require_admin(): return
