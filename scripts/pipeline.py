@@ -3,9 +3,9 @@
 
 Runs the full pipeline:
   1. Process image with Gemini
-  2. Generate 3D model
+  2. Generate 3D model via Rodin
   3. Import to Blender, scale
-  4. Retopologize via QuadRemesher
+  4. Retopologize (QuadriFlow)
   5. Transfer rig
 """
 import argparse
@@ -37,6 +37,25 @@ def main():
     parser.add_argument("image", help="Input character image path")
     parser.add_argument("--skip-gemini", action="store_true", help="Skip Gemini processing")
     parser.add_argument("--skip-retopo", action="store_true", help="Skip retopology")
+
+    # Rodin settings
+    parser.add_argument("--tier", default="Sketch",
+                        choices=["Sketch", "Regular", "Detail", "Smooth", "Gen-2"],
+                        help="Rodin tier (default: Sketch)")
+    parser.add_argument("--quality", default="medium",
+                        choices=["high", "medium", "low", "extra-low"],
+                        help="Rodin quality (default: medium)")
+    parser.add_argument("--mesh-mode", default="Raw", choices=["Raw", "Quad"],
+                        help="Rodin mesh mode (default: Raw)")
+    parser.add_argument("--material", default="PBR", choices=["PBR", "Shaded", "All"],
+                        help="Rodin material (default: PBR)")
+    parser.add_argument("--tapose", action="store_true", help="Enable T/A pose")
+    parser.add_argument("--seed", type=int, default=None, help="Rodin seed (0-65535)")
+
+    # Retopo settings
+    parser.add_argument("--retopo-faces", type=int, default=25000,
+                        help="Target face count for retopology (default: 25000)")
+
     args = parser.parse_args()
 
     image_path = Path(args.image).resolve()
@@ -61,24 +80,33 @@ def main():
     else:
         processed_image = image_path
 
-    # Step 2: 3D Generation
-    run_step("3D Model Generation", [
+    # Step 2: 3D Generation (with Rodin settings)
+    step2_cmd = [
         sys.executable, str(SCRIPTS / "step2_generate_3d.py"),
-        str(processed_image), str(raw_model)
-    ])
+        str(processed_image), str(raw_model),
+        "--tier", args.tier,
+        "--quality", args.quality,
+        "--mesh-mode", args.mesh_mode,
+        "--material", args.material,
+    ]
+    if args.tapose:
+        step2_cmd.append("--tapose")
+    if args.seed is not None:
+        step2_cmd.extend(["--seed", str(args.seed)])
+    run_step("3D Model Generation", step2_cmd)
 
-    # Step 3: Blender scale (uses alpha bbox from source image)
+    # Step 3: Blender scale
     run_step("Scale Model", [
         "blender", "--background", "--python", str(SCRIPTS / "step3_scale.py"),
         "--", str(raw_model), str(scaled_model), str(processed_image)
     ])
 
-    # Step 4: Retopology via Instant Meshes
+    # Step 4: Retopology
     if not args.skip_retopo:
-        run_step("Retopology (Instant Meshes)", [
-            sys.executable, str(SCRIPTS / "step4_retopo.py"),
-            str(scaled_model), str(retopo_model),
-            "--faces", "5000", "--method", "instant"
+        run_step("Retopology (QuadriFlow)", [
+            "blender", "--background", "--python", str(SCRIPTS / "step4_retopo.py"),
+            "--", str(scaled_model), str(retopo_model),
+            "--faces", str(args.retopo_faces)
         ])
     else:
         retopo_model = scaled_model

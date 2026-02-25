@@ -25,7 +25,7 @@ def main():
     output_path = args[1]
 
     # Parse optional --faces
-    target_faces = 5000
+    target_faces = 25000
     for i, a in enumerate(args):
         if a == "--faces" and i + 1 < len(args):
             target_faces = int(args[i + 1])

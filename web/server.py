@@ -52,6 +52,19 @@ DEFAULT_GEMINI_PROMPT_PREFIX = (
 GEMINI_PROMPT_PREFIX = os.environ.get("GEMINI_PROMPT_PREFIX", DEFAULT_GEMINI_PROMPT_PREFIX)
 SHOW_BASE_IMAGE = os.environ.get("SHOW_BASE_IMAGE", "true").lower() == "true"
 
+# Rodin generation settings (configurable via admin)
+RODIN_TIER = os.environ.get("RODIN_TIER", "Sketch")
+RODIN_QUALITY = os.environ.get("RODIN_QUALITY", "medium")
+RODIN_MESH_MODE = os.environ.get("RODIN_MESH_MODE", "Raw")
+RODIN_MATERIAL = os.environ.get("RODIN_MATERIAL", "PBR")
+RODIN_FORMAT = os.environ.get("RODIN_FORMAT", "glb")
+RODIN_TAPOSE = os.environ.get("RODIN_TAPOSE", "false").lower() == "true"
+RODIN_SEED = os.environ.get("RODIN_SEED", "")
+
+# Retopology settings
+RETOPO_ENABLED = os.environ.get("RETOPO_ENABLED", "false").lower() == "true"
+RETOPO_FACES = int(os.environ.get("RETOPO_FACES", "25000"))
+
 # Async job tracking
 jobs = {}  # job_id -> {"status": ..., "result": ..., "error": ...}
 job_counter = 0
@@ -106,6 +119,13 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             image_bytes=image_bytes,
             filename="character.png",
             mime_type="image/png",
+            tier=RODIN_TIER,
+            quality=RODIN_QUALITY,
+            mesh_mode=RODIN_MESH_MODE,
+            geometry_file_format=RODIN_FORMAT,
+            material=RODIN_MATERIAL,
+            tapose=RODIN_TAPOSE,
+            seed=int(RODIN_SEED) if RODIN_SEED else None,
         )
         task_uuid = task["uuid"]
         subscription_key = task["jobs"]["subscription_key"]
@@ -150,9 +170,20 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             print(f"[Job {job_id}] No source image for scaling, using raw mesh")
             scaled_glb = raw_glb
 
-        # Phase 3: Retopology (TEMPORARILY DISABLED)
-        retopo_glb = scaled_glb
-        print(f"[Job {job_id}] Retopology SKIPPED (temporarily disabled)")
+        # Phase 3: Retopology
+        if RETOPO_ENABLED:
+            retopo_glb = MODELS_DIR / f"job{job_id}_retopo.glb"
+            print(f"[Job {job_id}] Retopologizing ({RETOPO_FACES} faces)...")
+            jobs[job_id]["status"] = "retopologizing"
+            ok, msg = run_blender_script("step4_retopo.py",
+                [str(scaled_glb), str(retopo_glb), "--faces", str(RETOPO_FACES)],
+                label=f"Job {job_id} Retopo")
+            if not ok:
+                print(f"[Job {job_id}] Retopo failed, using scaled mesh: {msg}")
+                retopo_glb = scaled_glb
+        else:
+            retopo_glb = scaled_glb
+            print(f"[Job {job_id}] Retopology SKIPPED (disabled in settings)")
 
         # Phase 4: Rig Transfer
         rig_path = TEMPLATES_DIR / "rig.fbx"
@@ -308,6 +339,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/admin/settings":
             if not self._require_admin(): return
             return self._handle_get_settings()
+        if self.path == "/api/admin/rodin-settings":
+            if not self._require_admin(): return
+            return self._handle_get_rodin_settings()
         if self.path.startswith("/api/job/"):
             job_id = self.path.split("/api/job/")[-1]
             if job_id in jobs:
@@ -337,6 +371,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/admin/settings":
             if not self._require_admin(): return
             return self._handle_save_settings()
+        if self.path == "/api/admin/rodin-settings":
+            if not self._require_admin(): return
+            return self._handle_save_rodin_settings()
         if self.path == "/api/admin/cleanup":
             if not self._require_admin(): return
             return self._handle_cleanup()
@@ -566,6 +603,99 @@ class Handler(SimpleHTTPRequestHandler):
         job_counter = 0
         print(f"Cleanup: deleted {len(deleted)} files")
         self._json_response({"success": True, "deleted": len(deleted), "files": deleted})
+
+    def _handle_get_rodin_settings(self):
+        self._json_response({
+            "tier": RODIN_TIER,
+            "quality": RODIN_QUALITY,
+            "mesh_mode": RODIN_MESH_MODE,
+            "material": RODIN_MATERIAL,
+            "format": RODIN_FORMAT,
+            "tapose": RODIN_TAPOSE,
+            "seed": RODIN_SEED,
+            "retopo_enabled": RETOPO_ENABLED,
+            "retopo_faces": RETOPO_FACES,
+        })
+
+    def _handle_save_rodin_settings(self):
+        global RODIN_TIER, RODIN_QUALITY, RODIN_MESH_MODE, RODIN_MATERIAL
+        global RODIN_FORMAT, RODIN_TAPOSE, RODIN_SEED
+        global RETOPO_ENABLED, RETOPO_FACES
+
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length)
+        data = json.loads(body)
+
+        # Validate tier
+        valid_tiers = {"Sketch", "Regular", "Detail", "Smooth", "Gen-2"}
+        valid_quality = {"high", "medium", "low", "extra-low"}
+        valid_mesh_mode = {"Raw", "Quad"}
+        valid_material = {"PBR", "Shaded", "All"}
+        valid_format = {"glb", "fbx", "obj", "usdz", "stl"}
+
+        if "tier" in data:
+            if data["tier"] not in valid_tiers:
+                self._json_response({"success": False, "error": f"Invalid tier. Must be one of: {valid_tiers}"}, 400)
+                return
+            RODIN_TIER = data["tier"]
+
+        if "quality" in data:
+            if data["quality"] not in valid_quality:
+                self._json_response({"success": False, "error": f"Invalid quality. Must be one of: {valid_quality}"}, 400)
+                return
+            RODIN_QUALITY = data["quality"]
+
+        if "mesh_mode" in data:
+            if data["mesh_mode"] not in valid_mesh_mode:
+                self._json_response({"success": False, "error": f"Invalid mesh_mode. Must be one of: {valid_mesh_mode}"}, 400)
+                return
+            RODIN_MESH_MODE = data["mesh_mode"]
+
+        if "material" in data:
+            if data["material"] not in valid_material:
+                self._json_response({"success": False, "error": f"Invalid material. Must be one of: {valid_material}"}, 400)
+                return
+            RODIN_MATERIAL = data["material"]
+
+        if "format" in data:
+            if data["format"] not in valid_format:
+                self._json_response({"success": False, "error": f"Invalid format. Must be one of: {valid_format}"}, 400)
+                return
+            RODIN_FORMAT = data["format"]
+
+        if "tapose" in data:
+            RODIN_TAPOSE = bool(data["tapose"])
+
+        if "seed" in data:
+            RODIN_SEED = str(data["seed"]).strip() if data["seed"] else ""
+
+        if "retopo_enabled" in data:
+            RETOPO_ENABLED = bool(data["retopo_enabled"])
+
+        if "retopo_faces" in data:
+            try:
+                RETOPO_FACES = max(1000, min(100000, int(data["retopo_faces"])))
+            except (ValueError, TypeError):
+                self._json_response({"success": False, "error": "retopo_faces must be a number (1000-100000)"}, 400)
+                return
+
+        # Persist to .env
+        _update_env_key("RODIN_TIER", RODIN_TIER)
+        _update_env_key("RODIN_QUALITY", RODIN_QUALITY)
+        _update_env_key("RODIN_MESH_MODE", RODIN_MESH_MODE)
+        _update_env_key("RODIN_MATERIAL", RODIN_MATERIAL)
+        _update_env_key("RODIN_FORMAT", RODIN_FORMAT)
+        _update_env_key("RODIN_TAPOSE", str(RODIN_TAPOSE).lower())
+        _update_env_key("RODIN_SEED", RODIN_SEED)
+        _update_env_key("RETOPO_ENABLED", str(RETOPO_ENABLED).lower())
+        _update_env_key("RETOPO_FACES", str(RETOPO_FACES))
+
+        print(f"Updated Rodin settings: tier={RODIN_TIER}, quality={RODIN_QUALITY}, "
+              f"mesh_mode={RODIN_MESH_MODE}, material={RODIN_MATERIAL}, format={RODIN_FORMAT}, "
+              f"tapose={RODIN_TAPOSE}, seed={RODIN_SEED}")
+        print(f"Updated Retopo settings: enabled={RETOPO_ENABLED}, faces={RETOPO_FACES}")
+
+        self._json_response({"success": True})
 
     def _handle_get_prompt_prefix(self):
         self._json_response({"prefix": GEMINI_PROMPT_PREFIX})

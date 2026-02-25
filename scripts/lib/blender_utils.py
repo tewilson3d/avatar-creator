@@ -312,7 +312,7 @@ def scale_to_image(meshes, image_path: str, target_height: float = 1.8,
 # RETOPOLOGY
 # =============================================================================
 
-def quadriflow_remesh(mesh_obj, target_faces: int = 5000) -> dict:
+def quadriflow_remesh(mesh_obj, target_faces: int = 25000) -> dict:
     """Run QuadriFlow remesh on a mesh object.
 
     Returns:

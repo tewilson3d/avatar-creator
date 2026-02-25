@@ -1,6 +1,18 @@
 """Rodin (Hyper3D) API client for 3D model generation.
 
 Shared by step2_generate_3d.py and web/server.py.
+
+Rodin API parameters:
+    tier:       Sketch (free), Regular, Detail, Smooth, Gen-2
+    quality:    high (50k), medium (18k), low (8k), extra-low (4k)
+                Sketch is fixed to medium.
+    mesh_mode:  Raw (triangular) or Quad. Sketch = Raw only.
+    TAPose:     bool - force T/A pose for humanoid models
+    seed:       0-65535
+    material:   PBR, Shaded, All
+    geometry_file_format: glb, fbx, obj, usdz, stl
+    addons:     ["HighPack"] for 4K textures
+    bbox_condition: [width(Y), height(Z), length(X)] - bounding box hint
 """
 import json
 import os
@@ -10,6 +22,19 @@ import urllib.error
 from pathlib import Path
 
 BASE_URL = "https://api.hyper3d.com/api/v2"
+
+# Default settings
+DEFAULTS = {
+    "tier": "Sketch",
+    "quality": "medium",
+    "mesh_mode": "Raw",
+    "geometry_file_format": "glb",
+    "material": "PBR",
+    "TAPose": False,
+    "seed": None,
+    "addons": None,
+    "bbox_condition": None,
+}
 
 
 def make_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
@@ -45,11 +70,26 @@ def make_multipart(fields: dict, files: dict) -> tuple[bytes, str]:
     return body, f"multipart/form-data; boundary={boundary}"
 
 
-def submit_task(api_key: str, image_path: str = None, image_bytes: bytes = None,
-                filename: str = "character.png", mime_type: str = "image/png") -> dict:
-    """Submit image-to-3D generation task with Sketch tier.
+def submit_task(
+    api_key: str,
+    image_path: str = None,
+    image_bytes: bytes = None,
+    filename: str = "character.png",
+    mime_type: str = "image/png",
+    tier: str = None,
+    quality: str = None,
+    mesh_mode: str = None,
+    geometry_file_format: str = None,
+    material: str = None,
+    tapose: bool = None,
+    seed: int = None,
+    addons: list[str] = None,
+    bbox_condition: list[float] = None,
+) -> dict:
+    """Submit image-to-3D generation task.
 
     Provide either image_path (reads from disk) or image_bytes (raw bytes).
+    All Rodin parameters default to DEFAULTS if not specified.
 
     Returns:
         Rodin API response dict with 'uuid' and 'jobs' keys.
@@ -66,11 +106,41 @@ def submit_task(api_key: str, image_path: str = None, image_bytes: bytes = None,
     elif not image_bytes:
         raise ValueError("Provide either image_path or image_bytes")
 
+    # Build fields with defaults
+    tier = tier or DEFAULTS["tier"]
+    quality = quality or DEFAULTS["quality"]
+    mesh_mode = mesh_mode or DEFAULTS["mesh_mode"]
+    geometry_file_format = geometry_file_format or DEFAULTS["geometry_file_format"]
+    material = material or DEFAULTS["material"]
+
     fields = {
-        "tier": "Sketch",
-        "geometry_file_format": "glb",
-        "material": "PBR",
+        "tier": tier,
+        "geometry_file_format": geometry_file_format,
+        "material": material,
     }
+
+    # Quality is only configurable on non-Sketch tiers
+    if tier != "Sketch":
+        fields["quality"] = quality
+        fields["mesh_mode"] = mesh_mode
+
+    # Optional boolean/value params
+    if tapose is True or (tapose is None and DEFAULTS["TAPose"]):
+        fields["TAPose"] = "true"
+
+    if seed is not None:
+        fields["seed"] = str(seed)
+    elif DEFAULTS["seed"] is not None:
+        fields["seed"] = str(DEFAULTS["seed"])
+
+    if addons or DEFAULTS["addons"]:
+        a = addons or DEFAULTS["addons"]
+        fields["addons"] = json.dumps(a)
+
+    if bbox_condition or DEFAULTS["bbox_condition"]:
+        bc = bbox_condition or DEFAULTS["bbox_condition"]
+        fields["bbox_condition"] = json.dumps(bc)
+
     files = {
         "images": (filename, image_bytes, mime_type),
     }
@@ -87,7 +157,14 @@ def submit_task(api_key: str, image_path: str = None, image_bytes: bytes = None,
         method="POST",
     )
 
-    print(f"Submitting to Rodin Sketch (Gen-1)...")
+    print(f"Submitting to Rodin ({tier})...")
+    print(f"  Settings: quality={quality}, mesh_mode={mesh_mode}, "
+          f"material={material}, format={geometry_file_format}")
+    if tapose or DEFAULTS["TAPose"]:
+        print(f"  TAPose: enabled")
+    if seed is not None or DEFAULTS["seed"] is not None:
+        print(f"  Seed: {seed or DEFAULTS['seed']}")
+
     with urllib.request.urlopen(req, timeout=60) as resp:
         result = json.loads(resp.read())
 
@@ -173,11 +250,26 @@ def download_results(api_key: str, task_uuid: str, output_dir: str) -> list[str]
     return downloaded
 
 
-def run_pipeline(api_key: str, image_path: str = None, image_bytes: bytes = None,
-                 output_dir: str = ".", filename: str = "character.png",
-                 mime_type: str = "image/png",
-                 timeout_sec: int = 300) -> tuple[str, list[str]]:
-    """Run full Rodin pipeline: submit → poll → download.
+def run_pipeline(
+    api_key: str,
+    image_path: str = None,
+    image_bytes: bytes = None,
+    output_dir: str = ".",
+    filename: str = "character.png",
+    mime_type: str = "image/png",
+    timeout_sec: int = 300,
+    # Rodin generation settings (all optional, use DEFAULTS)
+    tier: str = None,
+    quality: str = None,
+    mesh_mode: str = None,
+    geometry_file_format: str = None,
+    material: str = None,
+    tapose: bool = None,
+    seed: int = None,
+    addons: list[str] = None,
+    bbox_condition: list[float] = None,
+) -> tuple[str, list[str]]:
+    """Run full Rodin pipeline: submit \u2192 poll \u2192 download.
 
     Returns:
         (task_uuid, downloaded_paths)
@@ -185,8 +277,13 @@ def run_pipeline(api_key: str, image_path: str = None, image_bytes: bytes = None
     Raises:
         RuntimeError on failure.
     """
-    task = submit_task(api_key, image_path=image_path, image_bytes=image_bytes,
-                       filename=filename, mime_type=mime_type)
+    task = submit_task(
+        api_key, image_path=image_path, image_bytes=image_bytes,
+        filename=filename, mime_type=mime_type,
+        tier=tier, quality=quality, mesh_mode=mesh_mode,
+        geometry_file_format=geometry_file_format, material=material,
+        tapose=tapose, seed=seed, addons=addons, bbox_condition=bbox_condition,
+    )
     task_uuid = task["uuid"]
     subscription_key = task["jobs"]["subscription_key"]
 

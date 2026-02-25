@@ -47,7 +47,7 @@ def parse_args():
         'output_path': args[3],
         'target_height': 1.8,
         'z_scale_method': 'average',
-        'retopo_faces': 5000,
+        'retopo_faces': 25000,
         'skip_retopo': False,
         'skip_scale': False,
     }
