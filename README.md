@@ -27,26 +27,15 @@ All pipeline logic lives in shared modules — no duplication across scripts:
   box calculations, alpha-channel subject detection, mesh scaling, QuadriFlow retopo,
   rig transfer (align, weight transfer, armature parenting), cleanup
 
-### Step Scripts (`scripts/step[1-5]_*.py`)
+### Blender Scripts (`scripts/step[3-5]_*.py`)
 
-Thin CLI wrappers around the shared lib. Each can run standalone:
+Blender scripts called by the web server:
 
 ```bash
-python scripts/step1_gemini_process.py <input_image> <output_image>
-python scripts/step2_generate_3d.py <input_image> <output.glb> [--tier X --quality X ...]
 blender --background --python scripts/step3_scale.py -- <in.glb> <out.glb> <image>
 blender --background --python scripts/step4_retopo.py -- <in.glb> <out.glb> [--faces N]
 blender --background --python scripts/step5_rig_transfer.py -- <mesh.glb> <rig.fbx> <out.fbx>
 ```
-
-### Combined Script (`scripts/combined_scale_retopo_rig.py`)
-
-Runs steps 3+4+5 in a single Blender session (avoids repeated startup overhead).
-Used by the web pipeline.
-
-### Pipeline Orchestrator (`scripts/pipeline.py`)
-
-Runs the full 5-step pipeline end-to-end via subprocess calls.
 
 ### Web Server (`web/server.py`)
 
@@ -69,14 +58,10 @@ Run with systemd or `python web/server.py`.
 ```
 scripts/
   lib/                # Shared library (gemini.py, rodin.py, blender_utils.py)
-  step1_gemini_process.py
-  step2_generate_3d.py
   step3_scale.py      # Blender script
   step4_retopo.py     # Blender script
   step5_rig_transfer.py  # Blender script
-  combined_scale_retopo_rig.py  # Blender script (steps 3+4+5)
   save_comparison_blend.py      # Blender script
-  pipeline.py         # CLI orchestrator
 web/
   server.py           # HTTP server
   index.html          # Main UI
@@ -123,23 +108,6 @@ ADMIN_PASS=...
 
 All settings are also configurable via CLI flags (see `pipeline.py --help`)
 and the web admin panel (`/api/admin/rodin-settings`).
-
-## CLI Usage
-
-```bash
-# Full pipeline with defaults
-python scripts/pipeline.py input/character.png
-
-# With Rodin settings
-python scripts/pipeline.py input/character.png \
-  --tier Regular --quality high --mesh-mode Quad --tapose
-
-# Custom retopo
-python scripts/pipeline.py input/character.png --retopo-faces 50000
-
-# Skip steps
-python scripts/pipeline.py input/character.png --skip-gemini --skip-retopo
-```
 
 ## Requirements
 

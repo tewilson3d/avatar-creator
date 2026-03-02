@@ -374,8 +374,6 @@ class Handler(SimpleHTTPRequestHandler):
             filepath = MODELS_DIR / filename
             if filepath.exists() and filepath.suffix == ".glb":
                 return self._serve_file(filepath)
-        if self.path == "/scripts/combined_scale_retopo_rig.py":
-            return self._serve_file(SCRIPTS_DIR / "combined_scale_retopo_rig.py", attachment=True)
         if self.path.startswith("/output/"):
             filename = self.path.split("/output/")[-1]
             return self._serve_file(OUTPUT_DIR / filename, attachment=True)
