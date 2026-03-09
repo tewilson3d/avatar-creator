@@ -204,8 +204,11 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
 
         print(f"[Job {job_id}] Saving comparison .blend...")
         jobs[job_id]["status"] = "saving_blend"
+        blend_args = [str(rigged_fbx), str(rig_path), str(comparison_blend)]
+        if source_image_path and Path(source_image_path).exists():
+            blend_args.append(source_image_path)
         ok, msg = run_blender_script("save_comparison_blend.py",
-            [str(rigged_fbx), str(rig_path), str(comparison_blend)],
+            blend_args,
             label=f"Job {job_id} Blend")
         if not ok:
             print(f"[Job {job_id}] Comparison blend failed (non-fatal): {msg}")

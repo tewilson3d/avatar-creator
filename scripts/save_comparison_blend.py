@@ -19,12 +19,13 @@ from lib.blender_utils import (
 def main():
     args = parse_blender_args(
         min_args=3,
-        usage="Usage: blender --background --python save_comparison_blend.py -- <mesh> <rig.fbx> <output.blend>"
+        usage="Usage: blender --background --python save_comparison_blend.py -- <mesh> <rig.fbx> <output.blend> [source.png]"
     )
 
     mesh_path = args[0]
     rig_path = args[1]
     output_path = args[2]
+    source_image_path = args[3] if len(args) > 3 else None
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
@@ -57,21 +58,9 @@ def main():
         obj.color = (0.4, 0.4, 0.8, 1.0)  # Blue tint
 
     # =========================================================================
-    # Offset the rig to the right
+    # Keep everything at origin
     # =========================================================================
-    print(f"\n=== Positioning side by side ===")
-
-    if gen_meshes:
-        _, _, gen_size, _ = get_combined_bounds(gen_meshes)
-        print(f"Generated mesh bounds: size={gen_size.x:.3f}x{gen_size.y:.3f}x{gen_size.z:.3f}")
-    else:
-        gen_size = mathutils.Vector((1, 1, 1))
-
-    offset_x = gen_size.x * 1.5 + 0.5
-    rig_roots = [o for o in rig_objects if o.parent is None or o.parent not in rig_objects]
-    for obj in rig_roots:
-        obj.location.x += offset_x
-    print(f"Offset rig by {offset_x:.3f} on X axis")
+    print(f"\n=== All assets at origin (0,0,0) ===")
 
     # =========================================================================
     # Organize into collections
@@ -90,6 +79,59 @@ def main():
         if obj.name in bpy.context.scene.collection.objects:
             bpy.context.scene.collection.objects.unlink(obj)
         rig_col.objects.link(obj)
+
+    # =========================================================================
+    # Add reference image plane
+    # =========================================================================
+    if source_image_path and os.path.exists(source_image_path):
+        print(f"\n=== Adding reference image plane: {source_image_path} ===")
+        img = bpy.data.images.load(os.path.abspath(source_image_path))
+        w, h = img.size
+        aspect = w / h if h > 0 else 1.0
+
+        # Get mesh height for scaling the plane
+        if gen_meshes:
+            _, _, gen_size, _ = get_combined_bounds(gen_meshes)
+            plane_height = gen_size.z
+        else:
+            plane_height = 2.0
+        plane_width = plane_height * aspect
+
+        bpy.ops.mesh.primitive_plane_add(size=1, location=(0, 0, plane_height / 2))
+        plane = bpy.context.active_object
+        plane.name = "Reference Image"
+        plane.scale = (plane_width, plane_height, 1)
+        # Rotate to face front (stand upright on XZ plane)
+        plane.rotation_euler = (1.5708, 0, 0)  # 90 degrees on X
+        # Move behind the mesh
+        plane.location.y = gen_size.y if gen_meshes else 0.5
+
+        # Create material with image texture
+        mat = bpy.data.materials.new(name="Reference Image")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+        tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.image = img
+        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+        bsdf.inputs['Roughness'].default_value = 1.0
+        output = nodes.new('ShaderNodeOutputMaterial')
+        links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+        links.new(tex_node.outputs['Alpha'], bsdf.inputs['Alpha'])
+        links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+        mat.blend_method = 'BLEND' if hasattr(mat, 'blend_method') else None
+        plane.data.materials.append(mat)
+
+        # Add to a collection
+        ref_col = bpy.data.collections.new("Reference Image")
+        bpy.context.scene.collection.children.link(ref_col)
+        if plane.name in bpy.context.scene.collection.objects:
+            bpy.context.scene.collection.objects.unlink(plane)
+        ref_col.objects.link(plane)
+        print(f"Image plane: {plane_width:.2f}x{plane_height:.2f}, behind mesh at Y={plane.location.y:.2f}")
+    else:
+        print("\n=== No source image provided, skipping image plane ===")
 
     # =========================================================================
     # Set up lighting
