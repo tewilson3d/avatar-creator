@@ -15,9 +15,10 @@ import sys
 
 def import_model(filepath: str):
     """Import a 3D model (GLB/FBX/OBJ) into the current Blender scene."""
+    filepath = os.path.abspath(os.path.normpath(filepath))
     ext = os.path.splitext(filepath)[1].lower()
     if ext in ('.glb', '.gltf'):
-        bpy.ops.import_scene.gltf(filepath=filepath)
+        _import_gltf(filepath)
     elif ext == '.fbx':
         bpy.ops.import_scene.fbx(filepath=filepath)
     elif ext == '.obj':
@@ -26,13 +27,64 @@ def import_model(filepath: str):
         raise ValueError(f"Unsupported format: {ext}")
 
 
+def _import_gltf(filepath: str):
+    """Import glTF/GLB. Use addon's unit_import in background (operator often fails without GUI)."""
+    filepath = os.path.abspath(os.path.normpath(filepath))
+    if not os.path.isfile(filepath):
+        raise RuntimeError("glTF file not found: %s" % filepath)
+    directory = os.path.dirname(filepath) + os.sep
+
+    # Ensure glTF addon is loaded (needed in background)
+    try:
+        import addon_utils
+        addon_utils.enable("io_scene_gltf2", default_set=True, persistent=False)
+    except Exception:
+        pass
+
+    # Prefer unit_import when it works (bypasses operator poll/context issues in some Blender versions).
+    # In 4.3.x unit_import can raise (e.g. bpy_struct.__new__), so fall back to operator.
+    import sys
+    mod = sys.modules.get("io_scene_gltf2")
+    if not mod:
+        for name, m in list(sys.modules.items()):
+            if m and hasattr(m, "ImportGLTF2"):
+                mod = m
+                break
+    if mod and hasattr(mod, "ImportGLTF2"):
+        op_class = mod.ImportGLTF2
+        if hasattr(op_class, "unit_import"):
+            try:
+                op = op_class()
+                op.filepath = filepath
+                op.directory = directory
+                op.files = None
+                op.loglevel = 0
+                import_settings = op.as_keywords(ignore=("filter_glob",))
+                result = op.unit_import(filepath, import_settings)
+                if result == {"FINISHED"}:
+                    return
+            except Exception as e:
+                # unit_import broken in this Blender (e.g. 4.3.2 API); use operator below
+                pass
+
+    # Operator path (works in background in 4.3.x; 4.3+ dropped "directory" keyword)
+    res = bpy.ops.import_scene.gltf(filepath=filepath)
+    if res != {"FINISHED"}:
+        raise RuntimeError("glTF import failed (operator returned %s). File: %s" % (res, filepath))
+
+
 def export_model(filepath: str, **kwargs):
     """Export scene to GLB/FBX/OBJ based on file extension."""
+    filepath = os.path.abspath(os.path.normpath(filepath))
     ext = os.path.splitext(filepath)[1].lower()
-    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
 
     if ext in ('.glb', '.gltf'):
-        bpy.ops.export_scene.gltf(filepath=filepath, export_format='GLB', **kwargs)
+        gltf_defaults = {'export_yup': True}
+        gltf_defaults.update(kwargs)
+        res = bpy.ops.export_scene.gltf(filepath=filepath, export_format='GLB', **gltf_defaults)
+        if res != {"FINISHED"}:
+            raise RuntimeError("GLB/GLTF export failed (operator returned %s). File: %s" % (res, filepath))
     elif ext == '.fbx':
         defaults = {
             'use_selection': False,
@@ -43,12 +95,20 @@ def export_model(filepath: str, **kwargs):
             'embed_textures': True,
         }
         defaults.update(kwargs)
-        bpy.ops.export_scene.fbx(filepath=filepath, **defaults)
+        res = bpy.ops.export_scene.fbx(filepath=filepath, **defaults)
+        if res != {"FINISHED"}:
+            raise RuntimeError("FBX export failed (operator returned %s). File: %s" % (res, filepath))
     elif ext == '.obj':
-        bpy.ops.wm.obj_export(filepath=filepath, **kwargs)
+        res = bpy.ops.wm.obj_export(filepath=filepath, **kwargs)
+        if res != {"FINISHED"}:
+            raise RuntimeError("OBJ export failed (operator returned %s). File: %s" % (res, filepath))
     else:
         # Default to GLB
-        bpy.ops.export_scene.gltf(filepath=filepath, export_format='GLB', **kwargs)
+        gltf_defaults = {'export_yup': True}
+        gltf_defaults.update(kwargs)
+        res = bpy.ops.export_scene.gltf(filepath=filepath, export_format='GLB', **gltf_defaults)
+        if res != {"FINISHED"}:
+            raise RuntimeError("GLB export failed (operator returned %s). File: %s" % (res, filepath))
 
 
 def clear_scene():
@@ -312,7 +372,7 @@ def scale_to_image(meshes, image_path: str, target_height: float = 1.8,
 # RETOPOLOGY
 # =============================================================================
 
-def quadriflow_remesh(mesh_obj, target_faces: int = 25000) -> dict:
+def quadriflow_remesh(mesh_obj, target_faces: int = 5000) -> dict:
     """Run QuadriFlow remesh on a mesh object.
 
     Returns:

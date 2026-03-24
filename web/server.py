@@ -10,8 +10,6 @@ import secrets
 import subprocess
 import threading
 import urllib.request
-import zipfile
-import io
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
@@ -20,7 +18,7 @@ SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from lib.gemini import call_gemini_with_retry
-from lib.rodin import make_multipart, submit_task, poll_status, download_results
+from lib.meshy import submit_task, poll_status, download_results
 
 PORT = 8000
 WEB_DIR = Path(__file__).parent
@@ -44,28 +42,17 @@ def load_env():
 load_env()
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
+MESHY_API_KEY = os.environ.get("MESHY_API_KEY", "")
 GEMINI_MODEL = "gemini-3-pro-image-preview"
 
 DEFAULT_GEMINI_PROMPT_PREFIX = (
-    "keep the exact same style, proportions and pose, please change the character "
-    "to look the following, but do not add a face:"
+    "keep the exact same style, proportions and pose, please change the character to look the following, "
+    "no matter what the prompt says keep all hair styles short, "
+    "absolutely no hats or head wear, absolutely no headwear that protrudes the head silhouette "
+    "from any costume or head design or literal prompt, on a solid white background."
 )
 GEMINI_PROMPT_PREFIX = os.environ.get("GEMINI_PROMPT_PREFIX", DEFAULT_GEMINI_PROMPT_PREFIX)
 SHOW_BASE_IMAGE = os.environ.get("SHOW_BASE_IMAGE", "true").lower() == "true"
-
-# Rodin generation settings (configurable via admin)
-RODIN_TIER = os.environ.get("RODIN_TIER", "Sketch")
-RODIN_QUALITY = os.environ.get("RODIN_QUALITY", "medium")
-RODIN_MESH_MODE = os.environ.get("RODIN_MESH_MODE", "Raw")
-RODIN_MATERIAL = os.environ.get("RODIN_MATERIAL", "PBR")
-RODIN_FORMAT = os.environ.get("RODIN_FORMAT", "glb")
-RODIN_TAPOSE = os.environ.get("RODIN_TAPOSE", "false").lower() == "true"
-RODIN_SEED = os.environ.get("RODIN_SEED", "")
-
-# Retopology settings
-RETOPO_ENABLED = os.environ.get("RETOPO_ENABLED", "false").lower() == "true"
-RETOPO_FACES = int(os.environ.get("RETOPO_FACES", "25000"))
 
 # Async job tracking
 jobs = {}  # job_id -> {"status": ..., "result": ..., "error": ...}
@@ -112,34 +99,27 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Phase 1: Rodin 3D Generation (using shared lib)
-        print(f"[Job {job_id}] Submitting to Rodin Sketch...")
+        # Phase 1: Meshy 3D Generation
+        print(f"[Job {job_id}] Submitting to Meshy...")
         jobs[job_id]["status"] = "submitting"
 
         task = submit_task(
-            api_key=RODIN_API_KEY,
+            api_key=MESHY_API_KEY,
             image_bytes=image_bytes,
             filename="character.png",
             mime_type="image/png",
-            tier=RODIN_TIER,
-            quality=RODIN_QUALITY,
-            mesh_mode=RODIN_MESH_MODE,
-            geometry_file_format=RODIN_FORMAT,
-            material=RODIN_MATERIAL,
-            tapose=RODIN_TAPOSE,
-            seed=int(RODIN_SEED) if RODIN_SEED else None,
         )
-        task_uuid = task["uuid"]
-        subscription_key = task["jobs"]["subscription_key"]
-        print(f"[Job {job_id}] Task UUID: {task_uuid}")
+        task_uuid = task["job_id"]
+        task_endpoint = task["endpoint"]
+        print(f"[Job {job_id}] Meshy Task ID: {task_uuid}")
 
         jobs[job_id]["status"] = "generating"
-        if not poll_status(RODIN_API_KEY, subscription_key, timeout_sec=300):
-            raise Exception("Rodin job failed or timed out")
+        if not poll_status(MESHY_API_KEY, task_uuid, timeout_sec=300, endpoint=task_endpoint):
+            raise Exception("Meshy job failed or timed out")
 
-        print(f"[Job {job_id}] Downloading Rodin results...")
+        print(f"[Job {job_id}] Downloading Meshy results...")
         jobs[job_id]["status"] = "downloading"
-        downloaded = download_results(RODIN_API_KEY, task_uuid, str(MODELS_DIR))
+        downloaded = download_results(MESHY_API_KEY, task_uuid, str(MODELS_DIR), endpoint=task_endpoint)
 
         # Rename downloaded files with job prefix
         raw_glb = None
@@ -172,20 +152,9 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             print(f"[Job {job_id}] No source image for scaling, using raw mesh")
             scaled_glb = raw_glb
 
-        # Phase 3: Retopology
-        if RETOPO_ENABLED:
-            retopo_glb = MODELS_DIR / f"job{job_id}_retopo.glb"
-            print(f"[Job {job_id}] Retopologizing ({RETOPO_FACES} faces)...")
-            jobs[job_id]["status"] = "retopologizing"
-            ok, msg = run_blender_script("step4_retopo.py",
-                [str(scaled_glb), str(retopo_glb), "--faces", str(RETOPO_FACES)],
-                label=f"Job {job_id} Retopo")
-            if not ok:
-                print(f"[Job {job_id}] Retopo failed, using scaled mesh: {msg}")
-                retopo_glb = scaled_glb
-        else:
-            retopo_glb = scaled_glb
-            print(f"[Job {job_id}] Retopology SKIPPED (disabled in settings)")
+        # Phase 3: Retopology (TEMPORARILY DISABLED)
+        retopo_glb = scaled_glb
+        print(f"[Job {job_id}] Retopology SKIPPED (temporarily disabled)")
 
         # Phase 4: Rig Transfer
         rig_path = TEMPLATES_DIR / "rig.fbx"
@@ -197,22 +166,20 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
             [str(retopo_glb), str(rig_path), str(rigged_fbx)],
             label=f"Job {job_id} Rig")
         if not ok:
-            raise Exception(f"Rig transfer failed: {msg}")
+            print(f"[Job {job_id}] Rig transfer failed (non-fatal, returning raw GLB): {msg}")
+            rigged_fbx = None
 
-        # Phase 5: Comparison .blend
-        comparison_blend = OUTPUT_DIR / f"job{job_id}_comparison.blend"
-
-        print(f"[Job {job_id}] Saving comparison .blend...")
-        jobs[job_id]["status"] = "saving_blend"
-        blend_args = [str(rigged_fbx), str(rig_path), str(comparison_blend)]
-        if source_image_path and Path(source_image_path).exists():
-            blend_args.append(source_image_path)
-        ok, msg = run_blender_script("save_comparison_blend.py",
-            blend_args,
-            label=f"Job {job_id} Blend")
-        if not ok:
-            print(f"[Job {job_id}] Comparison blend failed (non-fatal): {msg}")
-            comparison_blend = None
+        # Phase 5: Comparison .blend (only if rig succeeded)
+        comparison_blend = None
+        if rigged_fbx and rigged_fbx.exists():
+            blend_path = OUTPUT_DIR / f"job{job_id}_comparison.blend"
+            print(f"[Job {job_id}] Saving comparison .blend...")
+            jobs[job_id]["status"] = "saving_blend"
+            ok, msg = run_blender_script("save_comparison_blend.py",
+                [str(rigged_fbx), str(rig_path), str(blend_path)],
+                label=f"Job {job_id} Blend")
+            if ok:
+                comparison_blend = blend_path
 
         # Done!
         print(f"[Job {job_id}] Pipeline complete!")
@@ -220,11 +187,10 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
         result_data = {
             "glb_url": f"/models/{raw_glb.name}",
             "glb_filename": raw_glb.name,
-            "fbx_url": f"/output/{rigged_fbx.name}",
-            "fbx_filename": rigged_fbx.name,
         }
-        if scaled_glb and scaled_glb.exists() and scaled_glb != raw_glb:
-            result_data["scaled_glb_filename"] = scaled_glb.name
+        if rigged_fbx and rigged_fbx.exists():
+            result_data["fbx_url"] = f"/output/{rigged_fbx.name}"
+            result_data["fbx_filename"] = rigged_fbx.name
         if comparison_blend and comparison_blend.exists():
             result_data["blend_url"] = f"/output/{comparison_blend.name}"
             result_data["blend_filename"] = comparison_blend.name
@@ -240,10 +206,15 @@ def generate_3d_rodin(image_bytes: bytes, job_id: str, source_image_path: str = 
 
 def run_blender_script(script_name: str, args: list[str], label: str = "") -> tuple[bool, str]:
     """Run a Blender script. Returns (success, stdout_or_error)."""
+    blender = os.environ.get("BLENDER_PATH", "blender")
     script = str(SCRIPTS_DIR / script_name)
-    cmd = ["blender", "--background", "--python", script, "--"] + args
+    cmd = [blender, "--background", "--python", script, "--"] + args
     print(f"[{label}] Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except FileNotFoundError:
+        print(f"[{label}] SKIPPED: Blender not found on PATH")
+        return False, "Blender not installed or not on PATH"
     print(result.stdout[-1000:] if result.stdout else "")
     if result.returncode != 0:
         err = result.stderr[-500:] if result.stderr else "Blender failed"
@@ -276,7 +247,10 @@ class Handler(SimpleHTTPRequestHandler):
         return token in admin_sessions if token else False
 
     def _require_admin(self):
-        return True
+        if self._is_admin_authed():
+            return True
+        self._json_response({"error": "Unauthorized"}, 401)
+        return False
 
     # --- Response helpers ---
 
@@ -308,67 +282,6 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    # --- Zip bundle ---
-
-    def _handle_job_zip(self, job_id):
-        """Create and serve a zip of all job outputs (FBX, GLB, .blend, source PNG)."""
-        if job_id not in jobs or jobs[job_id].get("status") != "done":
-            return self._json_response({"error": "Job not found or not complete"}, 404)
-
-        result = jobs[job_id].get("result", {})
-        files_to_zip = []
-
-        # Source PNG
-        source_png = MODELS_DIR / f"job{job_id}_source.png"
-        if source_png.exists():
-            files_to_zip.append((source_png, f"source.png"))
-
-        # Raw GLB
-        glb_filename = result.get("glb_filename", "")
-        if glb_filename:
-            glb_path = MODELS_DIR / glb_filename
-            if glb_path.exists():
-                files_to_zip.append((glb_path, glb_filename))
-
-        # Scaled GLB (high-res mesh)
-        scaled_glb_filename = result.get("scaled_glb_filename", "")
-        if scaled_glb_filename:
-            scaled_path = MODELS_DIR / scaled_glb_filename
-            if scaled_path.exists():
-                files_to_zip.append((scaled_path, scaled_glb_filename))
-
-        # Rigged FBX
-        fbx_filename = result.get("fbx_filename", "")
-        if fbx_filename:
-            fbx_path = OUTPUT_DIR / fbx_filename
-            if fbx_path.exists():
-                files_to_zip.append((fbx_path, fbx_filename))
-
-        # Comparison .blend
-        blend_filename = result.get("blend_filename", "")
-        if blend_filename:
-            blend_path = OUTPUT_DIR / blend_filename
-            if blend_path.exists():
-                files_to_zip.append((blend_path, blend_filename))
-
-        if not files_to_zip:
-            return self._json_response({"error": "No files found for this job"}, 404)
-
-        # Build zip in memory
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for filepath, arcname in files_to_zip:
-                zf.write(filepath, arcname)
-        zip_bytes = buf.getvalue()
-
-        zip_name = f"job{job_id}_avatar.zip"
-        self.send_response(200)
-        self.send_header("Content-Type", "application/zip")
-        self.send_header("Content-Length", str(len(zip_bytes)))
-        self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
-        self.end_headers()
-        self.wfile.write(zip_bytes)
-
     # --- Routing ---
 
     def do_GET(self):
@@ -377,6 +290,8 @@ class Handler(SimpleHTTPRequestHandler):
             filepath = MODELS_DIR / filename
             if filepath.exists() and filepath.suffix == ".glb":
                 return self._serve_file(filepath)
+        if self.path == "/scripts/combined_scale_retopo_rig.py":
+            return self._serve_file(SCRIPTS_DIR / "combined_scale_retopo_rig.py", attachment=True)
         if self.path.startswith("/output/"):
             filename = self.path.split("/output/")[-1]
             return self._serve_file(OUTPUT_DIR / filename, attachment=True)
@@ -387,6 +302,11 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/admin/check":
             return self._json_response({"authed": self._is_admin_authed()})
         if self.path == "/admin":
+            if not self._is_admin_authed():
+                self.send_response(302)
+                self.send_header("Location", "/admin/login")
+                self.end_headers()
+                return
             return self._serve_file(WEB_DIR / "admin.html")
         if self.path == "/api/admin/config":
             if not self._require_admin(): return
@@ -397,19 +317,13 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/admin/settings":
             if not self._require_admin(): return
             return self._handle_get_settings()
-        if self.path == "/api/admin/rodin-settings":
-            if not self._require_admin(): return
-            return self._handle_get_rodin_settings()
-        if self.path.startswith("/api/job/") and "/zip" not in self.path:
+        if self.path.startswith("/api/job/"):
             job_id = self.path.split("/api/job/")[-1]
             if job_id in jobs:
                 self._json_response(jobs[job_id])
             else:
                 self._json_response({"status": "not_found"}, 404)
             return
-        if self.path.startswith("/api/job/") and self.path.endswith("/zip"):
-            job_id = self.path.split("/api/job/")[1].split("/zip")[0]
-            return self._handle_job_zip(job_id)
         return super().do_GET()
 
     def do_POST(self):
@@ -432,9 +346,6 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == "/api/admin/settings":
             if not self._require_admin(): return
             return self._handle_save_settings()
-        if self.path == "/api/admin/rodin-settings":
-            if not self._require_admin(): return
-            return self._handle_save_rodin_settings()
         if self.path == "/api/admin/cleanup":
             if not self._require_admin(): return
             return self._handle_cleanup()
@@ -627,9 +538,9 @@ class Handler(SimpleHTTPRequestHandler):
         ENV_FILE.write_text('\n'.join(lines) + '\n')
         for k, v in entries.items():
             os.environ[k] = v
-        global GEMINI_API_KEY, RODIN_API_KEY
+        global GEMINI_API_KEY, MESHY_API_KEY
         GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-        RODIN_API_KEY = os.environ.get("RODIN_API_KEY", "")
+        MESHY_API_KEY = os.environ.get("MESHY_API_KEY", "")
         self._json_response({"success": True})
 
     def _handle_get_settings(self):
@@ -664,99 +575,6 @@ class Handler(SimpleHTTPRequestHandler):
         job_counter = 0
         print(f"Cleanup: deleted {len(deleted)} files")
         self._json_response({"success": True, "deleted": len(deleted), "files": deleted})
-
-    def _handle_get_rodin_settings(self):
-        self._json_response({
-            "tier": RODIN_TIER,
-            "quality": RODIN_QUALITY,
-            "mesh_mode": RODIN_MESH_MODE,
-            "material": RODIN_MATERIAL,
-            "format": RODIN_FORMAT,
-            "tapose": RODIN_TAPOSE,
-            "seed": RODIN_SEED,
-            "retopo_enabled": RETOPO_ENABLED,
-            "retopo_faces": RETOPO_FACES,
-        })
-
-    def _handle_save_rodin_settings(self):
-        global RODIN_TIER, RODIN_QUALITY, RODIN_MESH_MODE, RODIN_MATERIAL
-        global RODIN_FORMAT, RODIN_TAPOSE, RODIN_SEED
-        global RETOPO_ENABLED, RETOPO_FACES
-
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        data = json.loads(body)
-
-        # Validate tier
-        valid_tiers = {"Sketch", "Regular", "Detail", "Smooth", "Gen-2"}
-        valid_quality = {"high", "medium", "low", "extra-low"}
-        valid_mesh_mode = {"Raw", "Quad"}
-        valid_material = {"PBR", "Shaded", "All"}
-        valid_format = {"glb", "fbx", "obj", "usdz", "stl"}
-
-        if "tier" in data:
-            if data["tier"] not in valid_tiers:
-                self._json_response({"success": False, "error": f"Invalid tier. Must be one of: {valid_tiers}"}, 400)
-                return
-            RODIN_TIER = data["tier"]
-
-        if "quality" in data:
-            if data["quality"] not in valid_quality:
-                self._json_response({"success": False, "error": f"Invalid quality. Must be one of: {valid_quality}"}, 400)
-                return
-            RODIN_QUALITY = data["quality"]
-
-        if "mesh_mode" in data:
-            if data["mesh_mode"] not in valid_mesh_mode:
-                self._json_response({"success": False, "error": f"Invalid mesh_mode. Must be one of: {valid_mesh_mode}"}, 400)
-                return
-            RODIN_MESH_MODE = data["mesh_mode"]
-
-        if "material" in data:
-            if data["material"] not in valid_material:
-                self._json_response({"success": False, "error": f"Invalid material. Must be one of: {valid_material}"}, 400)
-                return
-            RODIN_MATERIAL = data["material"]
-
-        if "format" in data:
-            if data["format"] not in valid_format:
-                self._json_response({"success": False, "error": f"Invalid format. Must be one of: {valid_format}"}, 400)
-                return
-            RODIN_FORMAT = data["format"]
-
-        if "tapose" in data:
-            RODIN_TAPOSE = bool(data["tapose"])
-
-        if "seed" in data:
-            RODIN_SEED = str(data["seed"]).strip() if data["seed"] else ""
-
-        if "retopo_enabled" in data:
-            RETOPO_ENABLED = bool(data["retopo_enabled"])
-
-        if "retopo_faces" in data:
-            try:
-                RETOPO_FACES = max(1000, min(100000, int(data["retopo_faces"])))
-            except (ValueError, TypeError):
-                self._json_response({"success": False, "error": "retopo_faces must be a number (1000-100000)"}, 400)
-                return
-
-        # Persist to .env
-        _update_env_key("RODIN_TIER", RODIN_TIER)
-        _update_env_key("RODIN_QUALITY", RODIN_QUALITY)
-        _update_env_key("RODIN_MESH_MODE", RODIN_MESH_MODE)
-        _update_env_key("RODIN_MATERIAL", RODIN_MATERIAL)
-        _update_env_key("RODIN_FORMAT", RODIN_FORMAT)
-        _update_env_key("RODIN_TAPOSE", str(RODIN_TAPOSE).lower())
-        _update_env_key("RODIN_SEED", RODIN_SEED)
-        _update_env_key("RETOPO_ENABLED", str(RETOPO_ENABLED).lower())
-        _update_env_key("RETOPO_FACES", str(RETOPO_FACES))
-
-        print(f"Updated Rodin settings: tier={RODIN_TIER}, quality={RODIN_QUALITY}, "
-              f"mesh_mode={RODIN_MESH_MODE}, material={RODIN_MATERIAL}, format={RODIN_FORMAT}, "
-              f"tapose={RODIN_TAPOSE}, seed={RODIN_SEED}")
-        print(f"Updated Retopo settings: enabled={RETOPO_ENABLED}, faces={RETOPO_FACES}")
-
-        self._json_response({"success": True})
 
     def _handle_get_prompt_prefix(self):
         self._json_response({"prefix": GEMINI_PROMPT_PREFIX})
