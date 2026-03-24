@@ -368,6 +368,89 @@ def scale_to_image(meshes, image_path: str, target_height: float = 1.8,
     return result
 
 
+def scale_to_images(meshes, front_image_path: str, side_image_path: str,
+                    target_height: float = 1.8) -> dict | None:
+    """Scale meshes using both front and side image alpha bounding boxes.
+
+    The front image provides width (X) and height (Z) proportions.
+    The side image provides depth (Y) proportions.
+    All three axes are scaled independently — no guessing for depth.
+
+    Args:
+        meshes: List of mesh objects
+        front_image_path: Front view image with alpha channel
+        side_image_path: Side view image with alpha channel
+        target_height: Desired height in scene units (default 1.8)
+
+    Returns:
+        Scale result dict, or None on failure.
+    """
+    print("\n--- Front image ---")
+    front_bbox = detect_bbox_from_alpha(front_image_path)
+    if not front_bbox:
+        print("ERROR: Could not detect bbox from front image")
+        return None
+
+    print("\n--- Side image ---")
+    side_bbox = detect_bbox_from_alpha(side_image_path)
+    if not side_bbox:
+        print("ERROR: Could not detect bbox from side image")
+        return None
+
+    front_w, front_h = front_bbox['dimensions']
+    side_w, side_h = side_bbox['dimensions']
+
+    # Front image: width → X, height → Z
+    # Side image: width → Y (depth), height → Z (should be consistent)
+    front_aspect = front_w / front_h
+    side_aspect = side_w / side_h
+
+    target_w = target_height * front_aspect   # X from front
+    target_d = target_height * side_aspect     # Y from side
+
+    print(f"\nFront aspect (W/H): {front_aspect:.4f} → target width (X):  {target_w:.4f}")
+    print(f"Side  aspect (W/H): {side_aspect:.4f} → target depth (Y):  {target_d:.4f}")
+    print(f"Target height (Z): {target_height:.4f}")
+
+    # Get current mesh dimensions
+    _, _, size, _ = get_mesh_bounds(meshes)
+    current_width = size.x
+    current_depth = size.y
+    current_height = size.z
+
+    if current_width <= 0 or current_depth <= 0 or current_height <= 0:
+        print("ERROR: Mesh has zero dimensions")
+        return None
+
+    scale_x = target_w / current_width
+    scale_y = target_d / current_depth
+    scale_z = target_height / current_height
+
+    print(f"\nCurrent mesh size: {current_width:.4f} x {current_depth:.4f} x {current_height:.4f} (WxDxH)")
+    print(f"Target mesh size:  {target_w:.4f} x {target_d:.4f} x {target_height:.4f} (WxDxH)")
+    print(f"Scale factors: X={scale_x:.4f}, Y={scale_y:.4f}, Z={scale_z:.4f}")
+
+    for obj in meshes:
+        obj.scale.x *= scale_x
+        obj.scale.y *= scale_y
+        obj.scale.z *= scale_z
+
+    # Apply transforms
+    for obj in meshes:
+        bpy.context.view_layer.objects.active = obj
+        obj.select_set(True)
+    bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
+
+    _, _, final_size, _ = get_mesh_bounds(meshes)
+    print(f"Final mesh size: {final_size.x:.4f} x {final_size.y:.4f} x {final_size.z:.4f} (WxDxH)")
+
+    return {
+        'scale_factors': (scale_x, scale_y, scale_z),
+        'original_size': (current_width, current_depth, current_height),
+        'final_size': (final_size.x, final_size.y, final_size.z),
+    }
+
+
 # =============================================================================
 # RETOPOLOGY
 # =============================================================================

@@ -154,8 +154,14 @@ def generate_3d_pipeline(image_bytes_list: list[bytes], job_id: str, source_imag
         if source_image_path and Path(source_image_path).exists():
             print(f"[Job {job_id}] Scaling mesh...")
             jobs[job_id]["status"] = "scaling"
+            scale_args = [str(raw_glb), str(scaled_glb), source_image_path]
+            # Pass side image for 3-axis scaling if available
+            side_image_path = str(MODELS_DIR / f"job{job_id}_source_side.png")
+            if Path(side_image_path).exists():
+                scale_args.append(side_image_path)
+                print(f"[Job {job_id}] Using front + side images for scaling")
             ok, msg = run_blender_script("step3_scale.py",
-                [str(raw_glb), str(scaled_glb), source_image_path],
+                scale_args,
                 label=f"Job {job_id} Scale")
             if not ok:
                 print(f"[Job {job_id}] Scale failed, using raw mesh: {msg}")
