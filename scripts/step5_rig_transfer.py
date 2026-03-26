@@ -13,7 +13,7 @@ sys.path.insert(0, str(os.path.join(os.path.dirname(os.path.abspath(__file__))))
 
 from lib.blender_utils import (
     clear_scene, import_model, export_model, get_scene_meshes,
-    join_meshes, find_armature, find_template_mesh, get_rig_objects,
+    join_meshes, find_armature, find_template_mesh,
     align_mesh_to_template, transfer_weights, parent_to_armature,
     cleanup_template_objects, parse_blender_args,
 )
@@ -52,10 +52,9 @@ def main():
         sys.exit(1)
     print(f"Template mesh: {template_mesh.name} ({len(template_mesh.data.vertices)} verts, {len(template_mesh.vertex_groups)} groups)")
 
-    # Track rig objects
-    rig_objects = get_rig_objects(armature)
-    rig_mesh_names = {obj.name for obj in rig_objects if obj.type == 'MESH'}
-    print(f"Rig objects: {[o.name for o in rig_objects]}")
+    # Snapshot every mesh name currently in the scene (all are rig/template objects)
+    pre_import_mesh_names = {obj.name for obj in bpy.context.scene.objects if obj.type == 'MESH'}
+    print(f"Pre-import meshes: {sorted(pre_import_mesh_names)}")
 
     # =========================================================================
     # Step 2: Import new mesh (wrap to capture Python exceptions; C-level crash exits without traceback)
@@ -79,7 +78,7 @@ def main():
 
     new_meshes = [
         obj for obj in bpy.context.scene.objects
-        if obj.type == 'MESH' and obj.name not in rig_mesh_names and obj not in rig_objects
+        if obj.type == 'MESH' and obj.name not in pre_import_mesh_names
     ]
     if not new_meshes:
         print("ERROR: No new mesh objects found after import")
@@ -99,6 +98,46 @@ def main():
 
     print(f"\n=== Setting up rig ===")
     parent_to_armature(new_mesh, armature)
+
+    # =========================================================================
+    # Step 3.5: Post-transfer skinning cleanup (non-fatal)
+    # =========================================================================
+    print(f"\n=== Post-transfer weight cleanup ===")
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+        new_mesh.select_set(True)
+        bpy.context.view_layer.objects.active = new_mesh
+
+        bpy.ops.object.vertex_group_smooth()
+        bpy.ops.object.vertex_group_normalize_all()
+        bpy.ops.object.vertex_group_limit_total()
+        bpy.ops.object.vertex_group_clean()
+        print("Weight cleanup done (smooth, normalize, limit total, clean)")
+    except Exception as e:
+        print(f"WARNING: Weight cleanup ops failed (non-fatal): {e}")
+
+    try:
+        # Enable Preserve Volume on the Armature modifier
+        arm_mod = next((m for m in new_mesh.modifiers if m.type == 'ARMATURE'), None)
+        if arm_mod:
+            arm_mod.use_deform_preserve_volume = True
+            print("Armature modifier: Preserve Volume enabled")
+
+        # Add Corrective Smooth modifier after the Armature modifier
+        cs_mod = new_mesh.modifiers.new(name="CorrectiveSmooth", type='CORRECTIVE_SMOOTH')
+        cs_mod.use_only_smooth = True
+        cs_mod.iterations = 5
+
+        # Move it to just after the Armature modifier (stack index arm_idx + 1)
+        if arm_mod:
+            arm_idx = next(i for i, m in enumerate(new_mesh.modifiers) if m.type == 'ARMATURE')
+            cs_idx = next(i for i, m in enumerate(new_mesh.modifiers) if m.name == cs_mod.name)
+            while cs_idx > arm_idx + 1:
+                bpy.ops.object.modifier_move_up(modifier=cs_mod.name)
+                cs_idx -= 1
+        print("Added CorrectiveSmooth modifier (only_smooth=True, iterations=5) after Armature")
+    except Exception as e:
+        print(f"WARNING: Corrective smooth / preserve volume setup failed (non-fatal): {e}")
 
     # =========================================================================
     # Step 4: Clean up and export
