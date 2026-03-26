@@ -88,13 +88,22 @@
   </div>
 
   <div class="section">
-    <div class="section-title">Gemini Prompt Prefix</div>
-    <p style="font-size:13px;color:#888;margin-bottom:12px">This text is always prepended to the user's input before sending to Gemini. The final prompt will be: <strong style="color:#4f9eff">prefix + user input</strong></p>
-    <textarea class="prefix-textarea" id="prefixField" placeholder="Loading..."></textarea>
-    <div class="prefix-hint">Example final prompt: <em id="prefixPreview" style="color:#aaa"></em></div>
+    <div class="section-title">Gemini Prompt Prefixes</div>
+    <p style="font-size:13px;color:#888;margin-bottom:16px">These are prepended to the user's input before sending to Gemini. Each view gets its own prefix to enforce the correct camera angle. Final prompt = <strong style="color:#4f9eff">prefix + user input</strong></p>
+
+    <div style="margin-bottom:20px">
+      <label style="display:block;font-size:13px;font-weight:600;color:#aaa;margin-bottom:6px">📷 Front View Prefix</label>
+      <textarea class="prefix-textarea" id="prefixFrontField" placeholder="Loading..."></textarea>
+    </div>
+
+    <div style="margin-bottom:12px">
+      <label style="display:block;font-size:13px;font-weight:600;color:#aaa;margin-bottom:6px">📷 Side View Prefix</label>
+      <textarea class="prefix-textarea" id="prefixSideField" placeholder="Loading..."></textarea>
+    </div>
+
     <div class="btn-row">
-      <button class="btn btn-primary" id="savePrefixBtn" onclick="savePrefix()">💾 Save Prefix</button>
-      <button class="btn btn-ghost btn-sm" onclick="resetPrefix()">↺ Reset Default</button>
+      <button class="btn btn-primary" id="savePrefixBtn" onclick="savePrefix()">💾 Save Prefixes</button>
+      <button class="btn btn-ghost btn-sm" onclick="resetPrefix()">↺ Reset Defaults</button>
     </div>
     <div class="status" id="prefixStatus"></div>
   </div>
@@ -118,27 +127,21 @@
 let config = [];
 let visibility = {};  // key -> bool (show/hide)
 
-const DEFAULT_PREFIX = 'keep the exact same style, proportions and pose, please change the character to look the following, but do not add a face:';
-const prefixField = document.getElementById('prefixField');
-const prefixPreview = document.getElementById('prefixPreview');
+const DEFAULT_PREFIX_FRONT = 'Generate an orthographic front view of this character on a solid white background. The camera should be perfectly centered, looking straight at the front of the character, with no perspective distortion. Keep the exact same style, proportions and a neutral standing pose with arms slightly away from the body. Please change the character to look the following, no matter what the prompt says keep all hair styles short, absolutely no hats or head wear, absolutely no headwear that protrudes the head silhouette from any costume or head design or literal prompt.';
+const DEFAULT_PREFIX_SIDE = 'Generate an orthographic side view (90 degree profile) of this character on a solid white background. The camera should be perfectly centered, looking straight at the right side of the character, with no perspective distortion. Keep the exact same style, proportions and a neutral standing pose with arms slightly away from the body. Please change the character to look the following, no matter what the prompt says keep all hair styles short, absolutely no hats or head wear, absolutely no headwear that protrudes the head silhouette from any costume or head design or literal prompt.';
+const prefixFrontField = document.getElementById('prefixFrontField');
+const prefixSideField = document.getElementById('prefixSideField');
 const prefixStatus = document.getElementById('prefixStatus');
-
-function updatePreview() {
-  const prefix = prefixField.value.trim();
-  prefixPreview.textContent = prefix + ' [user\'s character description]';
-}
-
-prefixField.addEventListener('input', updatePreview);
 
 async function loadPrefix() {
   try {
     const resp = await fetch('/api/admin/prompt-prefix');
     const data = await resp.json();
-    prefixField.value = data.prefix || DEFAULT_PREFIX;
-    updatePreview();
+    prefixFrontField.value = data.prefix_front || DEFAULT_PREFIX_FRONT;
+    prefixSideField.value = data.prefix_side || DEFAULT_PREFIX_SIDE;
   } catch(e) {
-    prefixField.value = DEFAULT_PREFIX;
-    updatePreview();
+    prefixFrontField.value = DEFAULT_PREFIX_FRONT;
+    prefixSideField.value = DEFAULT_PREFIX_SIDE;
   }
 }
 
@@ -151,11 +154,14 @@ async function savePrefix() {
     const resp = await fetch('/api/admin/prompt-prefix', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prefix: prefixField.value.trim() })
+      body: JSON.stringify({
+        prefix_front: prefixFrontField.value.trim(),
+        prefix_side: prefixSideField.value.trim()
+      })
     });
     const data = await resp.json();
     if (data.success) {
-      prefixStatus.textContent = '\u2713 Saved successfully';
+      prefixStatus.textContent = '\u2713 Both prefixes saved';
       prefixStatus.className = 'status success';
     } else {
       prefixStatus.textContent = 'Error: ' + (data.error || 'Unknown');
@@ -170,8 +176,8 @@ async function savePrefix() {
 }
 
 function resetPrefix() {
-  prefixField.value = DEFAULT_PREFIX;
-  updatePreview();
+  prefixFrontField.value = DEFAULT_PREFIX_FRONT;
+  prefixSideField.value = DEFAULT_PREFIX_SIDE;
 }
 
 loadPrefix();

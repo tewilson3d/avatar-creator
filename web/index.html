@@ -21,7 +21,7 @@
   .image-box img { max-width: 100%; max-height: 100%; object-fit: contain; }
   .prompt-section { margin-top: 24px; }
   .prompt-label { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 8px; }
-  .prompt-field { width: 100%; min-height: 60px; padding: 14px; background: #141414; border: 1px solid #222; border-radius: 8px; color: #e0e0e0; font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical; outline: none; transition: border-color 0.2s; }
+  .prompt-field { width: 100%; min-height: 140px; padding: 14px; background: #141414; border: 1px solid #222; border-radius: 8px; color: #e0e0e0; font-family: inherit; font-size: 14px; line-height: 1.5; resize: vertical; outline: none; transition: border-color 0.2s; }
   .prompt-field:focus { border-color: #4f9eff; }
   .prompt-field::placeholder { color: #444; }
   .step-divider { margin: 32px 0 24px; border-top: 1px solid #222; padding-top: 24px; }
@@ -85,7 +85,8 @@
 
   <div class="prompt-section">
     <div class="prompt-label">Character Changes</div>
-    <div id="prefixDisplay" style="font-size:12px;color:#555;margin-bottom:8px;font-style:italic;line-height:1.4"></div>
+    <div id="prefixDisplayFront" style="font-size:12px;color:#555;margin-bottom:4px;font-style:italic;line-height:1.4"></div>
+    <div id="prefixDisplaySide" style="font-size:12px;color:#555;margin-bottom:8px;font-style:italic;line-height:1.4"></div>
     <textarea class="prompt-field" id="promptField" placeholder="e.g. wearing a red cape and armor, with elf ears and blue skin..."></textarea>
   </div>
   <div class="btn-row">
@@ -132,12 +133,24 @@ async function fetchImageB64(url) {
 }
 
 // Helper: process one image through Gemini
-async function processWithGemini(imageUrl, prompt) {
-  const imgResp = await fetch(imageUrl);
-  const blob = await imgResp.blob();
+// imageSource can be a URL string or a base64 string (raw, no data: prefix)
+async function processWithGemini(imageSource, prompt, view = 'front') {
+  let blob;
+  if (imageSource.startsWith('data:') || imageSource.startsWith('http') || imageSource.startsWith('/')) {
+    // It's a URL — fetch it
+    const imgResp = await fetch(imageSource);
+    blob = await imgResp.blob();
+  } else {
+    // It's raw base64 — convert to blob
+    const byteChars = atob(imageSource);
+    const byteArray = new Uint8Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) byteArray[i] = byteChars.charCodeAt(i);
+    blob = new Blob([byteArray], { type: 'image/png' });
+  }
   const formData = new FormData();
   formData.append('image', blob, 'image.png');
   formData.append('prompt', prompt);
+  formData.append('view', view);
   const resp = await fetch('/api/process', { method: 'POST', body: formData });
   const data = await resp.json();
   return data;
@@ -151,8 +164,11 @@ async function processWithGemini(imageUrl, prompt) {
       fetch('/api/admin/settings')
     ]);
     const prefixData = await prefixResp.json();
-    if (prefixData.prefix) {
-      document.getElementById('prefixDisplay').textContent = 'Prefix: "' + prefixData.prefix + '"';
+    if (prefixData.prefix_front) {
+      document.getElementById('prefixDisplayFront').textContent = 'Front prefix: "' + prefixData.prefix_front.substring(0, 120) + '..."';
+    }
+    if (prefixData.prefix_side) {
+      document.getElementById('prefixDisplaySide').textContent = 'Side prefix: "' + prefixData.prefix_side.substring(0, 120) + '..."';
     }
     const settings = await settingsResp.json();
     if (settings.show_base_image) {
@@ -175,7 +191,7 @@ processBtn.addEventListener('click', async () => {
 
     // Process front image
     statusEl.textContent = 'Processing front image with Gemini (1/2)...';
-    const frontData = await processWithGemini('/base_front.png', prompt);
+    const frontData = await processWithGemini('/base_front.png', prompt, 'front');
     if (!frontData.success) {
       statusEl.textContent = 'Error (front): ' + (frontData.error || 'Unknown');
       statusEl.className = 'status error';
@@ -184,9 +200,9 @@ processBtn.addEventListener('click', async () => {
     processedFrontB64 = frontData.image;
     document.getElementById('outputFrontImg').src = 'data:image/png;base64,' + frontData.image;
 
-    // Process side image
-    statusEl.textContent = 'Processing side image with Gemini (2/2)...';
-    const sideData = await processWithGemini('/base_side.png', prompt);
+    // Process side image from front result
+    statusEl.textContent = 'Generating side view from front result (2/2)...';
+    const sideData = await processWithGemini(processedFrontB64, prompt, 'side');
     if (!sideData.success) {
       statusEl.textContent = 'Error (side): ' + (sideData.error || 'Unknown');
       statusEl.className = 'status error';

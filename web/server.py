@@ -11,6 +11,7 @@ import subprocess
 import threading
 import urllib.request
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from pathlib import Path
 
 # Allow imports from scripts/ directory
@@ -45,23 +46,42 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MESHY_API_KEY = os.environ.get("MESHY_API_KEY", "")
 GEMINI_MODEL = "gemini-3-pro-image-preview"
 
-DEFAULT_GEMINI_PROMPT_PREFIX = (
-    "keep the exact same style, proportions and pose, please change the character to look the following, "
+DEFAULT_GEMINI_PROMPT_PREFIX_FRONT = (
+    "Generate an orthographic front view of this character on a solid white background. "
+    "The camera should be perfectly centered, looking straight at the front of the character, with no perspective distortion. "
+    "Keep the exact same style, proportions and a neutral standing pose with arms slightly away from the body. "
+    "Please change the character to look the following, "
     "no matter what the prompt says keep all hair styles short, "
     "absolutely no hats or head wear, absolutely no headwear that protrudes the head silhouette "
-    "from any costume or head design or literal prompt, on a solid white background."
+    "from any costume or head design or literal prompt."
 )
-GEMINI_PROMPT_PREFIX = os.environ.get("GEMINI_PROMPT_PREFIX", DEFAULT_GEMINI_PROMPT_PREFIX)
+DEFAULT_GEMINI_PROMPT_PREFIX_SIDE = (
+    "Generate an orthographic side view (90 degree profile) of this character on a solid white background. "
+    "The camera should be perfectly centered, looking straight at the right side of the character, with no perspective distortion. "
+    "Keep the exact same style, proportions and a neutral standing pose with arms slightly away from the body. "
+    "Please change the character to look the following, "
+    "no matter what the prompt says keep all hair styles short, "
+    "absolutely no hats or head wear, absolutely no headwear that protrudes the head silhouette "
+    "from any costume or head design or literal prompt."
+)
+
+# Support legacy single prefix env var as fallback
+_legacy_prefix = os.environ.get("GEMINI_PROMPT_PREFIX", "")
+GEMINI_PROMPT_PREFIX_FRONT = os.environ.get("GEMINI_PROMPT_PREFIX_FRONT", _legacy_prefix or DEFAULT_GEMINI_PROMPT_PREFIX_FRONT)
+GEMINI_PROMPT_PREFIX_SIDE = os.environ.get("GEMINI_PROMPT_PREFIX_SIDE", _legacy_prefix or DEFAULT_GEMINI_PROMPT_PREFIX_SIDE)
 SHOW_BASE_IMAGE = os.environ.get("SHOW_BASE_IMAGE", "true").lower() == "true"
 
 # Async job tracking
 jobs = {}  # job_id -> {"status": ..., "result": ..., "error": ...}
-job_counter = 0
 job_lock = threading.Lock()
+
+def _make_job_id():
+    """Generate a short unique job ID (timestamp + random suffix)."""
+    return f"{int(time.time())}-{secrets.token_hex(3)}"
 
 # Admin auth
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "andyprez69")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 admin_sessions = set()  # valid session tokens
 
 
@@ -72,7 +92,7 @@ admin_sessions = set()  # valid session tokens
 def call_gemini(image_bytes: bytes, mime_type: str, prompt: str = "") -> tuple[bool, str]:
     """Send image to Gemini with retry. Returns (success, base64_image_or_error)."""
     image_b64 = base64.b64encode(image_bytes).decode()
-    text = prompt.strip() if prompt.strip() else GEMINI_PROMPT_PREFIX
+    text = prompt.strip() if prompt.strip() else GEMINI_PROMPT_PREFIX_FRONT
 
     success, result = call_gemini_with_retry(
         api_key=GEMINI_API_KEY,
@@ -154,8 +174,14 @@ def generate_3d_pipeline(image_bytes_list: list[bytes], job_id: str, source_imag
         if source_image_path and Path(source_image_path).exists():
             print(f"[Job {job_id}] Scaling mesh...")
             jobs[job_id]["status"] = "scaling"
+            scale_args = [str(raw_glb), str(scaled_glb), source_image_path]
+            # Pass side image for 3-axis scaling if available
+            side_image_path = str(MODELS_DIR / f"job{job_id}_source_side.png")
+            if Path(side_image_path).exists():
+                scale_args.append(side_image_path)
+                print(f"[Job {job_id}] Using front + side images for scaling")
             ok, msg = run_blender_script("step3_scale.py",
-                [str(raw_glb), str(scaled_glb), source_image_path],
+                scale_args,
                 label=f"Job {job_id} Scale")
             if not ok:
                 print(f"[Job {job_id}] Scale failed, using raw mesh: {msg}")
@@ -259,6 +285,9 @@ class Handler(SimpleHTTPRequestHandler):
         return token in admin_sessions if token else False
 
     def _require_admin(self):
+        if not self._is_admin_authed():
+            self._json_response({"success": False, "error": "Unauthorized"}, 401)
+            return False
         return True
 
     # --- Response helpers ---
@@ -316,10 +345,8 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._require_admin(): return
             return self._handle_get_config()
         if self.path == "/api/admin/prompt-prefix":
-            if not self._require_admin(): return
             return self._handle_get_prompt_prefix()
         if self.path == "/api/admin/settings":
-            if not self._require_admin(): return
             return self._handle_get_settings()
         if self.path.startswith("/api/job/"):
             job_id = self.path.split("/api/job/")[-1]
@@ -368,6 +395,7 @@ class Handler(SimpleHTTPRequestHandler):
         image_bytes = None
         mime_type = "image/png"
         prompt = ""
+        view = "front"
 
         for part in parts:
             if b'name="image"' in part:
@@ -384,12 +412,18 @@ class Handler(SimpleHTTPRequestHandler):
                 if data_start != -1:
                     prompt = part[data_start + 4:].rstrip(b"\r\n--").decode("utf-8", errors="replace").strip()
                     if prompt.endswith("--"): prompt = prompt[:-2].strip()
+            elif b'name="view"' in part:
+                data_start = part.find(b"\r\n\r\n")
+                if data_start != -1:
+                    view = part[data_start + 4:].rstrip(b"\r\n--").decode("utf-8", errors="replace").strip()
+                    if view.endswith("--"): view = view[:-2].strip()
 
         if not image_bytes:
             self._json_response({"success": False, "error": "No image in request"})
             return
 
-        final_prompt = (GEMINI_PROMPT_PREFIX + " " + prompt.strip()) if prompt.strip() else GEMINI_PROMPT_PREFIX
+        prefix = GEMINI_PROMPT_PREFIX_SIDE if view == "side" else GEMINI_PROMPT_PREFIX_FRONT
+        final_prompt = (prefix + " " + prompt.strip()) if prompt.strip() else prefix
         print(f"Processing image: {len(image_bytes)} bytes, {mime_type}")
         print(f"Final prompt: {final_prompt[:200]}..." if len(final_prompt) > 200 else f"Final prompt: {final_prompt}")
 
@@ -402,7 +436,6 @@ class Handler(SimpleHTTPRequestHandler):
     # --- API: 3D Generation ---
 
     def _handle_generate3d(self):
-        global job_counter
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         data = json.loads(body)
@@ -420,8 +453,7 @@ class Handler(SimpleHTTPRequestHandler):
         image_bytes_list = [base64.b64decode(b) for b in image_b64_list]
 
         with job_lock:
-            job_counter += 1
-            job_id = str(job_counter)
+            job_id = _make_job_id()
 
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         # Save front image as source for scaling
@@ -538,7 +570,7 @@ class Handler(SimpleHTTPRequestHandler):
                     config[k.strip()] = v.strip()
         items = []
         for k, v in config.items():
-            if k in ("GEMINI_PROMPT_PREFIX", "SHOW_BASE_IMAGE"):
+            if k in ("GEMINI_PROMPT_PREFIX", "GEMINI_PROMPT_PREFIX_FRONT", "GEMINI_PROMPT_PREFIX_SIDE", "SHOW_BASE_IMAGE"):
                 continue
             masked = v[:8] + '...' + v[-4:] if len(v) > 16 else '****'
             items.append({"key": k, "value": v, "masked": masked})
@@ -585,29 +617,47 @@ class Handler(SimpleHTTPRequestHandler):
                         deleted.append(str(f.relative_to(BASE_DIR)))
                     except Exception as e:
                         print(f"Failed to delete {f}: {e}")
-        global jobs, job_counter
+        global jobs
         jobs = {}
-        job_counter = 0
         print(f"Cleanup: deleted {len(deleted)} files")
         self._json_response({"success": True, "deleted": len(deleted), "files": deleted})
 
     def _handle_get_prompt_prefix(self):
-        self._json_response({"prefix": GEMINI_PROMPT_PREFIX})
+        self._json_response({
+            "prefix_front": GEMINI_PROMPT_PREFIX_FRONT,
+            "prefix_side": GEMINI_PROMPT_PREFIX_SIDE,
+            # Legacy field for backwards compat
+            "prefix": GEMINI_PROMPT_PREFIX_FRONT,
+        })
 
     def _handle_save_prompt_prefix(self):
-        global GEMINI_PROMPT_PREFIX
+        global GEMINI_PROMPT_PREFIX_FRONT, GEMINI_PROMPT_PREFIX_SIDE
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length)
         data = json.loads(body)
-        new_prefix = data.get("prefix", "").strip()
-        if not new_prefix:
-            self._json_response({"success": False, "error": "Prefix cannot be empty"})
+
+        # Support updating front, side, or both
+        updated = []
+        front = data.get("prefix_front", data.get("prefix", "")).strip()
+        side = data.get("prefix_side", "").strip()
+
+        if front:
+            GEMINI_PROMPT_PREFIX_FRONT = front
+            os.environ["GEMINI_PROMPT_PREFIX_FRONT"] = front
+            _update_env_key("GEMINI_PROMPT_PREFIX_FRONT", front)
+            updated.append("front")
+            print(f"Updated GEMINI_PROMPT_PREFIX_FRONT: {front[:80]}...")
+        if side:
+            GEMINI_PROMPT_PREFIX_SIDE = side
+            os.environ["GEMINI_PROMPT_PREFIX_SIDE"] = side
+            _update_env_key("GEMINI_PROMPT_PREFIX_SIDE", side)
+            updated.append("side")
+            print(f"Updated GEMINI_PROMPT_PREFIX_SIDE: {side[:80]}...")
+
+        if not updated:
+            self._json_response({"success": False, "error": "No prefix provided"})
             return
-        GEMINI_PROMPT_PREFIX = new_prefix
-        os.environ["GEMINI_PROMPT_PREFIX"] = new_prefix
-        _update_env_key("GEMINI_PROMPT_PREFIX", new_prefix)
-        print(f"Updated GEMINI_PROMPT_PREFIX: {new_prefix[:80]}...")
-        self._json_response({"success": True})
+        self._json_response({"success": True, "updated": updated})
 
     def log_message(self, format, *args):
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
@@ -638,12 +688,17 @@ def _update_env_key(key, value):
 # MAIN
 # =============================================================================
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle each request in a new thread so concurrent users don't block each other."""
+    daemon_threads = True
+
+
 def main():
     if not GEMINI_API_KEY:
         print("ERROR: GEMINI_API_KEY not set")
         sys.exit(1)
-    server = HTTPServer(("", PORT), Handler)
-    print(f"Server running on http://localhost:{PORT}", flush=True)
+    server = ThreadingHTTPServer(("", PORT), Handler)
+    print(f"Server running on http://localhost:{PORT} (threaded)", flush=True)
     print(f"Gemini model: {GEMINI_MODEL}", flush=True)
     try:
         server.serve_forever()
