@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <title>Avatar Pipeline</title>
 <script type="importmap">
 {"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
@@ -132,16 +134,16 @@ async function fetchImageB64(url) {
   });
 }
 
-// Helper: process one image through Gemini
+// Helper: process one image through Gemini (async with polling)
 // imageSource can be a URL string or a base64 string (raw, no data: prefix)
 async function processWithGemini(imageSource, prompt, view = 'front') {
   let blob;
-  if (imageSource.startsWith('data:') || imageSource.startsWith('http') || imageSource.startsWith('/')) {
-    // It's a URL — fetch it
+  const isURL = imageSource.startsWith('data:') || imageSource.startsWith('http') || (imageSource.startsWith('/') && imageSource.length < 500);
+  if (isURL) {
     const imgResp = await fetch(imageSource);
     blob = await imgResp.blob();
   } else {
-    // It's raw base64 — convert to blob
+    // Raw base64 string — convert to blob
     const byteChars = atob(imageSource);
     const byteArray = new Uint8Array(byteChars.length);
     for (let i = 0; i < byteChars.length; i++) byteArray[i] = byteChars.charCodeAt(i);
@@ -151,9 +153,27 @@ async function processWithGemini(imageSource, prompt, view = 'front') {
   formData.append('image', blob, 'image.png');
   formData.append('prompt', prompt);
   formData.append('view', view);
+
+  // Submit — returns immediately with job_id
   const resp = await fetch('/api/process', { method: 'POST', body: formData });
-  const data = await resp.json();
-  return data;
+  const submitData = await resp.json();
+  if (!submitData.success || !submitData.job_id) {
+    return submitData; // error from server
+  }
+
+  // Poll for result (no timeout — wait as long as needed)
+  const jobId = submitData.job_id;
+  while (true) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const pollResp = await fetch('/api/job/' + jobId);
+      const job = await pollResp.json();
+      if (job.status === 'done') return job.result;
+      if (job.status === 'error') return job.result || { success: false, error: job.error || 'Gemini processing failed' };
+    } catch (e) {
+      console.warn('Poll error, retrying...', e);
+    }
+  }
 }
 
 // Load settings and prompt prefix
@@ -216,7 +236,8 @@ processBtn.addEventListener('click', async () => {
     statusEl.className = 'status success';
     showStep2();
   } catch (e) {
-    statusEl.textContent = 'Error: ' + e.message;
+    const hint = e.message.includes('Failed to fetch') ? ' (server may be busy or connection dropped — try again)' : '';
+    statusEl.textContent = 'Error: ' + e.message + hint;
     statusEl.className = 'status error';
   } finally {
     document.getElementById('spinnerWrap').style.display = 'none';
@@ -326,7 +347,8 @@ generate3dBtn.addEventListener('click', async () => {
       status3d.className = 'status error';
     }
   } catch(e) {
-    status3d.textContent = 'Error: ' + e.message;
+    const hint = e.message.includes('Failed to fetch') ? ' (server may be busy or connection dropped — try again)' : '';
+    status3d.textContent = 'Error: ' + e.message + hint;
     status3d.className = 'status error';
   } finally {
     generate3dBtn.disabled = false;

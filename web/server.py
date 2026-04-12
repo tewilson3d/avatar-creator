@@ -317,6 +317,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if attachment:
             self.send_header("Content-Disposition", f'attachment; filename="{filepath.name}"')
+        if filepath.suffix == '.html':
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         self.wfile.write(data)
 
@@ -372,17 +374,15 @@ class Handler(SimpleHTTPRequestHandler):
             if not self._require_admin(): return
             return self._handle_save_config()
         if self.path == "/api/admin/prompt-prefix":
-            if not self._require_admin(): return
             return self._handle_save_prompt_prefix()
         if self.path == "/api/admin/settings":
-            if not self._require_admin(): return
             return self._handle_save_settings()
         if self.path == "/api/admin/cleanup":
             if not self._require_admin(): return
             return self._handle_cleanup()
         self.send_error(404)
 
-    # --- API: Image processing ---
+    # --- API: Image processing (async via job polling) ---
 
     def _handle_process(self):
         content_type = self.headers.get("Content-Type", "")
@@ -424,14 +424,34 @@ class Handler(SimpleHTTPRequestHandler):
 
         prefix = GEMINI_PROMPT_PREFIX_SIDE if view == "side" else GEMINI_PROMPT_PREFIX_FRONT
         final_prompt = (prefix + " " + prompt.strip()) if prompt.strip() else prefix
-        print(f"Processing image: {len(image_bytes)} bytes, {mime_type}")
-        print(f"Final prompt: {final_prompt[:200]}..." if len(final_prompt) > 200 else f"Final prompt: {final_prompt}")
 
-        success, result = call_gemini(image_bytes, mime_type, final_prompt)
-        if success:
-            self._json_response({"success": True, "image": result})
-        else:
-            self._json_response({"success": False, "error": result})
+        # Create async job and return immediately
+        with job_lock:
+            job_id = _make_job_id()
+        jobs[job_id] = {"status": "processing", "type": "gemini"}
+
+        def _run_gemini():
+            req_id = f"gemini-{job_id}"
+            print(f"[{req_id}] Processing image: {len(image_bytes)} bytes, {mime_type}")
+            print(f"[{req_id}] Final prompt: {final_prompt[:200]}..." if len(final_prompt) > 200 else f"[{req_id}] Final prompt: {final_prompt}")
+            try:
+                t0 = time.time()
+                success, result = call_gemini(image_bytes, mime_type, final_prompt)
+                elapsed = time.time() - t0
+                print(f"[{req_id}] Gemini {'OK' if success else 'FAIL'} in {elapsed:.1f}s")
+                if success:
+                    jobs[job_id]["status"] = "done"
+                    jobs[job_id]["result"] = {"success": True, "image": result}
+                else:
+                    jobs[job_id]["status"] = "error"
+                    jobs[job_id]["result"] = {"success": False, "error": result}
+            except Exception as e:
+                print(f"[{req_id}] Gemini exception: {e}")
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["result"] = {"success": False, "error": str(e)}
+
+        threading.Thread(target=_run_gemini, daemon=True).start()
+        self._json_response({"success": True, "job_id": job_id})
 
     # --- API: 3D Generation ---
 
@@ -539,7 +559,7 @@ class Handler(SimpleHTTPRequestHandler):
             admin_sessions.add(token)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Set-Cookie", f"admin_session={token}; Path=/; HttpOnly; SameSite=Strict")
+            self.send_header("Set-Cookie", f"admin_session={token}; Path=/; HttpOnly; SameSite=Lax")
             body = json.dumps({"success": True}).encode()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -660,7 +680,8 @@ class Handler(SimpleHTTPRequestHandler):
         self._json_response({"success": True, "updated": updated})
 
     def log_message(self, format, *args):
-        print(f"[{self.log_date_time_string()}] {format % args}", flush=True)
+        forwarded = self.headers.get('X-Forwarded-For', self.client_address[0])
+        print(f"[{self.log_date_time_string()}] [{forwarded}] {format % args}", flush=True)
 
 
 # =============================================================================
